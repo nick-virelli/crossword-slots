@@ -96,7 +96,7 @@ test('Omaha must use exactly two hole cards and three board cards', () => {
 // ---------- deck limits ----------
 
 test('crossword player limits match the spec table', () => {
-  const table = [[2, true, 12], [2, false, 13], [4, true, 5], [4, false, 6], [5, true, 4], [5, false, 5]];
+  const table = [[2, true, 12], [2, false, 13], [4, true, 6], [4, false, 6], [5, true, 5], [5, false, 5]];
   for (const [hole, co, max] of table) {
     assert.equal(crosswordMaxPlayers(hole, co), max);
     for (const layout of ['crossword', 'slots']) {
@@ -125,7 +125,13 @@ test('slots drops boards one at a time and blocks when none fit', () => {
 
 test('burn is the first thing dropped', () => {
   const rules = { ...DEFAULT_RULES, hole: 2, carryover: true, layout: 'crossword' };
-  assert.equal(planGame(rules, 12).burn, true); // 25 + 24 + 2 = 51, room for the burn
+  const tight = planGame(rules, 12); // 25 + 24 leaves 3: the Pocket takes them all, no burn
+  assert.equal(tight.pocket, 3);
+  assert.equal(tight.burn, false);
+  assert.equal(tight.cardsUsed, 52);
+  const roomy = planGame(rules, 2); // plenty left: the Pocket gets 5 and there is a burn
+  assert.equal(roomy.pocket, 5);
+  assert.equal(roomy.burn, true);
   const r4 = { ...DEFAULT_RULES, hole: 4, carryover: false, layout: 'slots', boards: 5 };
   assert.equal(planGame(r4, 8).cardsUsed, 52); // 32 + 20 = 52, no burn
   assert.equal(planGame(r4, 8).burn, false);
@@ -140,13 +146,14 @@ test('every dealt card is unique and the reveal order is flop, turn, river', () 
   const deck = makeDeck();
   const d = dealGame(rules, plan, ['a', 'b', 'c', 'd', 'e'], deck);
   const all = [...Object.values(d.hole).flat(), ...d.carryHole, d.burn, ...d.grid.flat()];
-  assert.equal(all.length, 50);
-  assert.equal(new Set(all).size, 50);
-  // with an unshuffled deck: 24 hole cards, 1 burn, then 15 flop, 5 turn, 5 river
-  assert.deepEqual(d.grid[0].slice(0, 3), deck.slice(25, 28));
-  assert.deepEqual(d.grid[1].slice(0, 3), deck.slice(28, 31));
-  assert.deepEqual(d.grid.map((r) => r[3]), deck.slice(40, 45));
-  assert.deepEqual(d.grid.map((r) => r[4]), deck.slice(45, 50));
+  assert.equal(d.carryHole.length, 5); // 52 - 25 - 20 leaves 7: the Pocket takes 5
+  assert.equal(all.length, 51);
+  assert.equal(new Set(all).size, 51);
+  // with an unshuffled deck: 20 hole cards, 5 for the Pocket, 1 burn, then 15 flop, 5 turn, 5 river
+  assert.deepEqual(d.grid[0].slice(0, 3), deck.slice(26, 29));
+  assert.deepEqual(d.grid[1].slice(0, 3), deck.slice(29, 32));
+  assert.deepEqual(d.grid.map((r) => r[3]), deck.slice(41, 46));
+  assert.deepEqual(d.grid.map((r) => r[4]), deck.slice(46, 51));
   const boards = boardsOf(d.grid, 'crossword');
   assert.equal(boards.length, 10);
   assert.deepEqual(boards[5], d.grid.map((r) => r[0])); // 1 Down is column 1
@@ -341,6 +348,54 @@ function playGame(s, rnd) {
 const chipTotal = (s) => s.players.reduce((a, p) => a + p.balance, 0) + s.carry.reduce((a, b) => a + b, 0);
 const join = (s, did, name) => claim(s, did, { name }).id;
 
+test('the Pocket takes every leftover card, up to five, whatever the players hold', () => {
+  // five players with five cards on a full crossword: 25 + 25 leaves exactly 2 for the Pocket
+  const five = planGame({ ...DEFAULT_RULES, hole: 5, layout: 'crossword', carryover: true }, 5);
+  assert.ok(five.ok);
+  assert.equal(five.pocket, 2);
+  assert.equal(five.cardsUsed, 52);
+  assert.equal(five.burn, false);
+  assert.match(five.notes.join(' '), /Pocket gets 2 cards/);
+  assert.equal(planGame({ ...DEFAULT_RULES, hole: 5, layout: 'crossword', carryover: true }, 6).ok, false);
+  // two Hold'em players leave lots of cards: the Pocket still gets five
+  assert.equal(planGame({ ...DEFAULT_RULES, hole: 2, layout: 'crossword', carryover: true }, 2).pocket, 5);
+  // slots keeps as many boards as it can and gives the Pocket the rest
+  const slots = planGame({ ...DEFAULT_RULES, hole: 4, layout: 'slots', boards: 5, carryover: true }, 6);
+  assert.equal(slots.rows, 5);
+  assert.equal(slots.pocket, 3);
+  // full Pineapple game with a 2-card Pocket: it never discards and plays both cards
+  for (const free of [false, true]) {
+    const s = newSession('TEST', 'hostDev', 'Host');
+    for (let i = 0; i < 4; i++) addBot(s);
+    setRules(s, { hole: 5, free, layout: 'crossword', carryover: true, discardTiming: 'post' });
+    const rnd = seeded(free ? 11 : 12);
+    for (let k = 0; k < 20; k++) {
+      playGame(s, rnd);
+      assert.equal(s.game.carryHole.length, 2);
+      assert.equal(s.game.carryDiscard, undefined);
+      assert.equal(chipTotal(s), 0);
+      for (const r of s.game.results) for (const w of r.winners) {
+        if (w.id !== CARRY_ID) continue;
+        const used = w.cards.filter((c) => s.game.carryHole.includes(c)).length;
+        if (free) assert.ok(used <= 2); else assert.equal(used, 2);
+      }
+    }
+  }
+  // a five-card Pocket in Hold'em plays at most two of its cards
+  const s = newSession('TEST', 'hostDev', 'Host');
+  addBot(s);
+  setRules(s, { hole: 2, layout: 'crossword', carryover: true });
+  const rnd = seeded(13);
+  for (let k = 0; k < 20; k++) {
+    playGame(s, rnd);
+    assert.equal(s.game.carryHole.length, 5);
+    for (const r of s.game.results) for (const w of r.winners) {
+      if (w.id === CARRY_ID) assert.ok(w.cards.filter((c) => s.game.carryHole.includes(c)).length <= 2);
+    }
+  }
+});
+
+
 test('chips are conserved across every option combination', () => {
   let seed = 1;
   for (const [hole, free] of [[2, false], [4, false], [5, false], [5, true]]) {
@@ -364,7 +419,7 @@ test('chips are conserved across every option combination', () => {
             if (!carryover) assert.ok(!carryLocked(s));
             if (hole === 5 && !free) {
               for (const id of g.order) assert.ok(Number.isInteger(g.discard[id]));
-              if (carryover) assert.ok(Number.isInteger(g.carryDiscard));
+              if (carryover) assert.equal(Number.isInteger(g.carryDiscard), g.carryHole.length === 5);
             } else {
               assert.deepEqual(g.discard, {});
             }
@@ -422,14 +477,17 @@ test('a carried slots pot blocks the deal when its board no longer fits', () => 
   s.carry[4] = 300; // pretend the Pocket won board 5
   s.players[0].balance = -300;
   assert.equal(viewFor(s, 'p1').plan.ok, true);
-  addBot(s); // 5 players + the Pocket with 5 cards: only 4 boards fit
+  addBot(s); // 5 players: 5 boards still fit, the Pocket just gets fewer cards
+  assert.equal(viewFor(s, 'p1').plan.ok, true);
+  addBot(s); // 6 players x 5 cards + 2 for the Pocket: only 4 boards fit
   const v = viewFor(s, 'p1');
   assert.equal(v.plan.ok, false);
   assert.match(v.plan.reason, /Board 5/);
   assert.match(deal(s, seeded(1)).error, /Board 5/);
-  removePlayer(s, s.players[4].id);
+  removePlayer(s, s.players[5].id);
   assert.deepEqual(deal(s, seeded(1)), { ok: true });
-  assert.equal(s.game.plan.pots[4], 160 + 300);
+  assert.equal(s.game.plan.pots[4], 200 + 300);
+  assert.equal(s.game.carryHole.length, 2);
 });
 
 test('ending with a pending carryover refunds it', () => {

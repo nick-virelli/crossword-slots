@@ -201,7 +201,8 @@ function openDiscards(s) {
   for (const id of g.order) {
     if (byId(s, id).bot) g.discard[id] = autoDiscard(g.hole[id], vis);
   }
-  if (g.carryHole) g.carryDiscard = autoDiscard(g.carryHole, vis);
+  // the Pocket only discards when it holds a full five, same as the players
+  if (g.carryHole && g.carryHole.length === 5) g.carryDiscard = autoDiscard(g.carryHole, vis);
 }
 
 export function deal(s, rnd) {

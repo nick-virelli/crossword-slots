@@ -39,6 +39,6 @@ Covers hand rankings, Hold'em and Omaha rules, deck limits, splits, carryovers, 
 - If the session ends with a carryover pot unclaimed, it is split evenly between the players of the last game.
 - Slots lets the host pick 1 to 5 boards; the deck may drop it lower.
 - Win percentages are true odds worked out from every hand (the host's phone knows them). In Pineapple they stay hidden until everyone has discarded. They always show when the host is the only human.
-- The Carryover hand is called the Pocket.
+- The Carryover hand is called the Pocket. It gets every card left in the deck after the grid and the players' hands, up to 5 and at least 2, whatever the players hold. That allows 5 players with 5 cards on a full Crossword (the Pocket gets 2). It plays by the game's rules: exactly 2 of its cards in Omaha and Pineapple, up to 2 in Hold'em and 5-Card Any. It only discards in Pineapple when it holds a full 5.
 - 5-Card Any: keep all five hole cards and play 0, 1 or 2 of them on each board.
 - Phones check in as a named player and can switch. A player's seat and balance belong to the name, not the phone. Past sessions are remembered on the host's phone only.

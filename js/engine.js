@@ -223,8 +223,12 @@ export function splitEven(total, n) {
   return Array.from({ length: n }, (_, i) => base + (i < extra ? 1 : 0));
 }
 
+// The Pocket (Carryover hand) takes whatever is left in the deck, up to 5 cards, and needs at least 2.
+export const POCKET_MIN = 2;
+export const POCKET_MAX = 5;
+
 export function crosswordMaxPlayers(hole, carryover) {
-  return Math.floor((52 - 25 - (carryover ? hole : 0)) / hole);
+  return Math.floor((52 - 25 - (carryover ? POCKET_MIN : 0)) / hole);
 }
 
 // Decide whether a game can be dealt and what shape it takes.
@@ -232,7 +236,8 @@ export function crosswordMaxPlayers(hole, carryover) {
 export function planGame(rules, nPlayers, carry = []) {
   const h = rules.hole;
   const co = !!rules.carryover;
-  const holeCards = nPlayers * h + (co ? h : 0);
+  const holeCards = nPlayers * h;
+  const reserve = co ? POCKET_MIN : 0;
   const notes = [];
   const fail = (reason) => ({ ok: false, reason, notes });
   if (nPlayers < 2) return fail('Need at least 2 players. Add a CPU player to play solo.');
@@ -247,9 +252,9 @@ export function planGame(rules, nPlayers, carry = []) {
     rows = 5;
     nBoards = 10;
   } else {
-    const fit = Math.floor((52 - holeCards) / 5);
+    const fit = Math.floor((52 - holeCards - reserve) / 5);
     if (fit < 1) {
-      return fail(`${nPlayers} players with ${h} cards each${co ? ' plus the Carryover hand' : ''} leaves no room in the deck for even one board.`);
+      return fail(`${nPlayers} players with ${h} cards each${co ? ' plus the Pocket' : ''} leaves no room in the deck for even one board.`);
     }
     rows = Math.min(rules.boards, fit, 5);
     nBoards = rows;
@@ -262,7 +267,9 @@ export function planGame(rules, nPlayers, carry = []) {
       }
     }
   }
-  const cards = rows * 5 + holeCards;
+  const pocket = co ? Math.min(POCKET_MAX, 52 - rows * 5 - holeCards) : 0;
+  if (co && pocket < POCKET_MAX) notes.push(`The Pocket gets ${pocket} cards this game: that is all the deck has left.`);
+  const cards = rows * 5 + holeCards + pocket;
   const burn = cards + 1 <= 52;
   if (!burn) notes.push('No burn card this game: the deck has no room for it.');
   const perPlayer = rules.stakeCents * (rules.layout === 'crossword' ? 2 : 1);
@@ -272,7 +279,7 @@ export function planGame(rules, nPlayers, carry = []) {
     notes.push(`${money(total)} doesn't split evenly over ${nBoards} boards, so the extra cents go to the lowest-numbered boards.`);
   }
   const pots = base.map((b, i) => b + (carry[i] || 0));
-  return { ok: true, notes, rows, nBoards, burn, cardsUsed: cards + (burn ? 1 : 0), perPlayer, total, base, pots };
+  return { ok: true, notes, rows, nBoards, burn, pocket, cardsUsed: cards + (burn ? 1 : 0), perPlayer, total, base, pots };
 }
 
 // Deal a whole game from an already shuffled deck.
@@ -281,7 +288,7 @@ export function dealGame(rules, plan, playerIds, deck) {
   const hole = {};
   for (const id of playerIds) { hole[id] = deck.slice(i, i + rules.hole); i += rules.hole; }
   let carryHole = null;
-  if (rules.carryover) { carryHole = deck.slice(i, i + rules.hole); i += rules.hole; }
+  if (plan.pocket) { carryHole = deck.slice(i, i + plan.pocket); i += plan.pocket; }
   let burn = null;
   if (plan.burn) burn = deck[i++];
   const grid = Array.from({ length: plan.rows }, () => Array(5).fill(null));
