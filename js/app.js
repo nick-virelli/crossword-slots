@@ -3,7 +3,8 @@
 // that player is allowed to see. Phones talk directly to each other through PeerJS.
 
 import * as S from './session.js';
-import { cryptoRnd, money, variantName, CARRY_ID } from './engine.js';
+import { cryptoRnd, money, variantName, CARRY_ID, makeDeck, playMode } from './engine.js';
+import { outlook } from './odds.js';
 
 const PEER_PREFIX = 'xwslots-v1-';
 const PAY_MS = 3200;
@@ -90,7 +91,7 @@ async function keepAwake() {
 
 // ---------- history kept on the host's phone ----------
 
-let hist = ls.json('xw_hist') || [];
+let hist = ls.json('xw_hist2') || [];
 let histCache = null;
 
 function histExtra() {
@@ -108,11 +109,19 @@ function histExtra() {
   histCache = { past: hist.slice(-8).reverse(), totals: list, roster: list.map((t) => t.name) };
   return histCache;
 }
-function saveHist() { hist = hist.slice(-60); ls.set('xw_hist', JSON.stringify(hist)); histCache = null; }
+function saveHist() { hist = hist.slice(-60); ls.set('xw_hist2', JSON.stringify(hist)); histCache = null; }
+// Long-term stats only count games between people. Games against CPU players never count.
 function recordSession() {
   const id = `${session.code}-${session.startedAt}`;
-  if (session.gameNo === 0 || hist.some((h) => h.id === id)) return;
-  hist.push({ id, when: Date.now(), games: session.gameNo, players: session.players.filter((p) => !p.bot).map((p) => ({ name: p.name, cents: p.balance })) });
+  if (hist.some((h) => h.id === id)) return;
+  const totals = new Map();
+  const add = (n) => { if (!n.bot) totals.set(n.name, (totals.get(n.name) || 0) + n.cents); };
+  const games = session.log.filter((l) => l.online);
+  for (const l of games) l.net.forEach(add);
+  if (!games.length) return;
+  const last = session.log[session.log.length - 1];
+  if (session.refund && session.refund.shares && last.online) session.refund.shares.forEach(add);
+  hist.push({ id, when: Date.now(), games: games.length, players: [...totals].map(([name, cents]) => ({ name, cents })) });
   saveHist();
 }
 function mergeHist(other) {
@@ -671,6 +680,43 @@ function winnersText(res) {
   return real.length > 1 ? `Split: ${names}` : `${names} wins ${money(real[0].cents)}`;
 }
 
+let outCache = { key: '', val: null };
+function myOutlook(g, i) {
+  if (!g.myHole) return null;
+  const key = [view.code, g.no, i, g.stage, g.myDiscard].join('|');
+  if (outCache.key === key) return outCache.val;
+  const inBoard = boardCells(g, i);
+  const board = [];
+  for (let r = 0; r < g.rows; r++) for (let c = 0; c < 5; c++) if (inBoard(r, c) && g.grid[r][c]) board.push(g.grid[r][c]);
+  let val = { empty: true };
+  if (board.length >= 3) {
+    const hole = g.myDiscard === null ? g.myHole : g.myHole.filter((_, k) => k !== g.myDiscard);
+    const seen = new Set([...g.myHole, ...g.grid.flat().filter(Boolean)]);
+    val = outlook(hole, board, makeDeck().filter((c) => !seen.has(c)), playMode(g.rules)) || { empty: true };
+  }
+  outCache = { key, val };
+  return val;
+}
+
+function renderOutlook(g, i) {
+  const o = myOutlook(g, i);
+  if (!o) return '';
+  if (o.empty) return '<p class="muted" style="margin:0 0 8px">No cards on this board yet.</p>';
+  const flip = o.toCome === 2 ? 'on the turn' : 'on the river';
+  // most likely first
+  const rows = o.rows.slice().sort((p, q) => (q.final ?? q.next) - (p.final ?? p.next)).map((r) => {
+    const bits = [];
+    if (r.cards.length) bits.push(`${r.cards.length} card${r.cards.length === 1 ? '' : 's'} · ${pct(r.next)} ${flip}`);
+    else bits.push('needs both cards to come');
+    if (r.final !== null) bits.push(`${pct(r.final)} by the river`);
+    const shown = r.cards.slice(0, 7);
+    return `<div class="lk"><div class="lkh"><b>${r.label}</b><span class="muted small">${bits.join(' · ')}</span></div>
+      ${shown.length ? `<div class="lkc">${mini(shown)}${r.cards.length > shown.length ? `<span class="muted small"> +${r.cards.length - shown.length} more</span>` : ''}</div>` : ''}</div>`;
+  }).join('');
+  return `<div class="mine"><div class="lkh"><span><span class="muted small">YOUR HAND</span><br><b>${esc(o.name)}</b></span>${mini(o.cards)}</div>
+    ${o.toCome ? (rows ? `<div class="muted small lkt">WHAT YOU'RE LOOKING FOR</div>${rows}` : '<p class="muted small" style="margin:6px 0 0">No single card turns this into a better kind of hand.</p>') : ''}</div>`;
+}
+
 const who = (x) => `${esc(x.name)}${x.id === view.you ? '<span class="tag gold">You</span>' : ''}`;
 
 function renderBoardDetail(g) {
@@ -679,6 +725,7 @@ function renderBoardDetail(g) {
   const res = g.results ? g.results.find((r) => r.index === i) : null;
   const odds = g.odds && g.odds.boards[i];
   let body;
+  const mine = res ? '' : renderOutlook(g, i);
   if (res) {
     const won = new Map(res.winners.map((w) => [w.id, w.cents]));
     body = `<ul class="plist">${res.all.map((x) => `<li class="${won.has(x.id) ? 'winner' : ''}"><span class="nm">${who(x)}<br><span class="muted small">${esc(x.handName)}${won.has(x.id) ? ` · <span class="co">${x.id === CARRY_ID ? 'carries' : 'wins'} ${money(won.get(x.id))}</span>` : ''}</span></span>${mini(x.cards)}</li>`).join('')}</ul>`;
@@ -686,9 +733,9 @@ function renderBoardDetail(g) {
     body = odds.map((x) => `<div class="orow ${x.id === CARRY_ID ? 'pk' : ''}"><span class="nm">${who(x)}</span><span class="track"><i style="width:${Math.round(x.share * 100)}%"></i></span><b>${pct(x.share)}</b></div>`).join('')
       + '<p class="muted small" style="margin:8px 0 0">Chance of winning this board right now. A split counts as a share.</p>';
   } else {
-    body = `<p class="muted" style="margin:0">${g.oddsWait ? 'Win % appears once everyone has discarded.' : g.hands ? 'This board has not been paid yet.' : 'Win % is turned off for this game.'}</p>`;
+    body = `<p class="muted small" style="margin:0">${g.oddsWait ? 'Win % appears once everyone has discarded.' : g.hands ? 'This board has not been paid yet.' : 'Win % is turned off for this game.'}</p>`;
   }
-  return `<div class="panel detail"><h2>${esc(g.labels[i])} · ${money(g.pots[i])} pot${g.carryIn[i] ? ` <span class="co">(${money(g.carryIn[i])} carried in)</span>` : ''}</h2>${body}</div>`;
+  return `<div class="panel detail"><h2>${esc(g.labels[i])} · ${money(g.pots[i])} pot${g.carryIn[i] ? ` <span class="co">(${money(g.carryIn[i])} carried in)</span>` : ''}</h2>${mine}${body}</div>`;
 }
 
 function renderEV(g) {
@@ -729,8 +776,8 @@ function renderTable(host) {
     const line = waiting ? `Waiting for ${esc(g.waitingOn.join(', '))} to discard…` : host ? '' : `Waiting for the host to reveal ${next}…`;
     if (line) mid = `<p class="status">${line}</p>`;
   }
-  const hint = ui.board === null && (g.odds || g.results)
-    ? `<p class="hint">Tap a board's number to see ${g.results ? 'every hand on it' : "everyone's chances"}.</p>` : '';
+  const hint = ui.board === null && g.stage !== 'pre' && (g.odds || g.results || g.myHole)
+    ? `<p class="hint">Tap a board's number to see ${g.results ? 'every hand on it' : g.odds ? "your hand, what you're looking for, and everyone's chances" : "your hand and what you're looking for"}.</p>` : '';
   let lower = '';
   if (g.hands) {
     const winIds = new Set(paying ? paying.winners.map((w) => w.id) : []);

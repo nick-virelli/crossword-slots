@@ -282,7 +282,8 @@ function showdown(s) {
   s.log.push({
     no: g.no,
     line: rulesLine(g.rules, g.plan.rows),
-    net: g.order.map((id) => ({ name: byId(s, id).name, cents: g.net[id] })),
+    net: g.order.map((id) => ({ name: byId(s, id).name, cents: g.net[id], bot: byId(s, id).bot })),
+    online: g.order.filter((id) => !byId(s, id).bot).length >= 2, // only games between people count long-term
     carried: carry.reduce((a, b) => a + b, 0),
   });
   g.stage = 'showdown';
@@ -328,7 +329,12 @@ export function endSession(s) {
     const ids = s.game ? s.game.order : playing(s).map((p) => p.id);
     const shares = splitEven(total, ids.length);
     ids.forEach((id, k) => { byId(s, id).balance += shares[k]; });
-    s.refund = { total, count: ids.length };
+    s.refund = {
+      total,
+      count: ids.length,
+      online: ids.filter((id) => !byId(s, id).bot).length >= 2,
+      shares: ids.map((id, k) => ({ name: byId(s, id).name, cents: shares[k], bot: byId(s, id).bot })),
+    };
     s.carry = Array(10).fill(0);
   }
   s.settle = settleUp(s.players.map((p) => ({ id: p.id, name: p.name, cents: p.balance })));

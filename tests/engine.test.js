@@ -5,7 +5,7 @@ import {
   shuffle, planGame, dealGame, boardsOf, resolveBoards, splitEven, settleUp, autoDiscard,
   crosswordMaxPlayers, CARRY_ID, DEFAULT_RULES,
 } from '../js/engine.js';
-import { computeOdds } from '../js/odds.js';
+import { computeOdds, outlook } from '../js/odds.js';
 import {
   newSession, addBot, claim, unclaim, removePlayer, setSitOut, passHost, setRules, deal, discard,
   autoDiscardRest, advance, toLobby, endSession, viewFor, carryLocked, oddsOn,
@@ -278,6 +278,49 @@ test('odds: exact on the turn, certain on the river, sensible before the flop', 
   // a split pot counts as half each
   const tie = computeOdds([{ id: 'a', cards: h('Ah 2d') }, { id: 'b', cards: h('Ad 2h') }], 'any', [h('Ks Kc 9s 9c 5d')], []);
   assert.deepEqual(tie, [{ a: 0.5, b: 0.5 }]);
+});
+
+test('outlook: current hand, what to look for, and the cards that get there', () => {
+  // 9 T in hand, Q K on board: any jack makes the straight
+  const hole = h('9h Tc');
+  const board = h('Qd Ks 2c');
+  const unseen = makeDeck().filter((c) => ![...hole, ...board].includes(c));
+  const o = outlook(hole, board, unseen, 'any');
+  assert.equal(o.name, 'King high');
+  assert.equal(o.toCome, 2);
+  const straight = o.rows.find((r) => r.label === 'Straight');
+  assert.deepEqual(straight.cards.sort(), ['Jc', 'Jd', 'Jh', 'Js']);
+  assert.ok(Math.abs(straight.next - 4 / 47) < 1e-9);
+  assert.ok(straight.final > straight.next && straight.final < 0.2);
+  const pair = o.rows.find((r) => r.label === 'Pair');
+  assert.equal(pair.cards.length, 15); // three each of 9, T, Q, K, 2
+  assert.ok(o.rows.find((r) => r.label === 'Two pair').cards.length === 0); // needs both cards
+  assert.ok(o.rows[0].category > o.rows[o.rows.length - 1].category);
+  // on the turn there is one card to come, and a finished board has nothing to look for
+  const turn = outlook(hole, [...board, 'Jd'], unseen.filter((c) => c !== 'Jd'), 'any');
+  assert.equal(turn.name, 'Straight, King high');
+  assert.equal(turn.rows.every((r) => r.final === null), true);
+  assert.equal(outlook(hole, h('Qd Ks 2c Jd 3s'), [], 'any').rows.length, 0);
+  // Omaha rules apply: four spades on board with one spade in hand is no flush draw made
+  const om = outlook(h('As Kd 7c 2h'), h('Qs 9s 4s'), makeDeck().filter((c) => !h('As Kd 7c 2h Qs 9s 4s').includes(c)), 'exact');
+  assert.equal(om.rows.find((r) => r.label === 'Flush'), undefined);
+});
+
+test('long-term stats only count games between people', () => {
+  const s = newSession('TEST', 'hostDev', 'Nick');
+  addBot(s);
+  deal(s, seeded(1));
+  while (s.game.stage !== 'done') advance(s);
+  assert.equal(s.log[0].online, false);
+  const pat = claim(s, 'devA', { name: 'Pat' }).id;
+  deal(s, seeded(2));
+  while (s.game.stage !== 'done') advance(s);
+  assert.equal(s.log[1].online, true);
+  assert.equal(s.log[1].net.filter((n) => !n.bot).length, 2);
+  setSitOut(s, pat, true);
+  deal(s, seeded(3));
+  while (s.game.stage !== 'done') advance(s);
+  assert.equal(s.log[2].online, false); // Pat watched, so it was a CPU game again
 });
 
 // ---------- full sessions ----------

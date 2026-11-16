@@ -196,3 +196,10 @@ details.hist summary { cursor: pointer; font-size: 12px; text-transform: upperca
 .hc { display: inline-block; font-size: 12.5px; margin: 2px 8px 0 0; font-variant-numeric: tabular-nums; }
 .hc.pos { color: var(--good); }
 .hc.neg { color: var(--bad); }
+
+.mine { border-bottom: 1px solid var(--line); padding-bottom: 10px; margin-bottom: 8px; }
+.lkh { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lkt { margin: 10px 0 2px; letter-spacing: 0.08em; }
+.lk { padding: 7px 0 2px; border-top: 1px dashed var(--line); margin-top: 6px; }
+.lk b { color: var(--gold); }
+.lkc { margin-top: 5px; }

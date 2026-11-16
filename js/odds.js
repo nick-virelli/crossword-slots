@@ -1,7 +1,7 @@
 // Crossword Slots — live win odds. Runs on the host's phone, which knows every hand,
 // so these are true odds (like the percentages on TV poker), not guesses.
 
-import { toInts, bestScoreI, combos } from './engine.js';
+import { toInts, bestScoreI, combos, bestHand, handName, handCategory } from './engine.js';
 
 // hands:  [{ id, cards }] every hand in play, the Pocket included
 // mode:   'any' | 'exact'
@@ -66,4 +66,51 @@ export function computeOdds(hands, mode, boards, unseen, rnd = Math.random, budg
     if (!cache.has(key)) cache.set(key, run(toInts(known)));
     return cache.get(key);
   });
+}
+
+export const CATEGORY_NAMES = ['High card', 'Pair', 'Two pair', 'Three of a kind', 'Straight', 'Flush', 'Full house', 'Four of a kind', 'Straight flush'];
+
+// One player's view of one board: the best hand they hold now and the better kinds of hand
+// they could still make, with the exact cards that would do it on the next flip.
+// Uses only what that player can see (their own cards and the face-up board).
+//   hole: the player's cards   board: 3 to 5 face-up cards   unseen: every card they can't see
+// Returns { name, cards, category, toCome, rows: [{ category, label, cards, next, final }] }
+//   next  = chance the very next card makes that hand
+//   final = chance of ending the board with exactly that hand (only when 2 cards are to come)
+export function outlook(hole, board, unseen, mode) {
+  const cur = bestHand(hole, board, mode);
+  if (!cur) return null;
+  const category = handCategory(cur.score);
+  const out = { name: handName(cur.score), cards: cur.cards, category, toCome: 5 - board.length, rows: [] };
+  if (board.length >= 5 || !unseen.length) return out;
+  const helps = new Map();
+  for (const c of unseen) {
+    const cat = handCategory(bestHand(hole, [...board, c], mode).score);
+    if (cat > category) { if (!helps.has(cat)) helps.set(cat, []); helps.get(cat).push(c); }
+  }
+  const final = new Map();
+  if (board.length === 3 && unseen.length >= 2) {
+    const H = toInts(hole);
+    const B = toInts(board);
+    const U = toInts(unseen);
+    const full = [B[0], B[1], B[2], 0, 0];
+    let total = 0;
+    for (let i = 0; i < U.length - 1; i++) {
+      for (let j = i + 1; j < U.length; j++) {
+        full[3] = U[i]; full[4] = U[j];
+        const cat = Math.floor(bestScoreI(H, full, mode) / 759375);
+        final.set(cat, (final.get(cat) || 0) + 1);
+        total++;
+      }
+    }
+    for (const [k, v] of final) final.set(k, v / total);
+  }
+  const order = '23456789TJQKA';
+  for (let cat = 8; cat > category; cat--) {
+    const cards = (helps.get(cat) || []).sort((a, b) => order.indexOf(b[0]) - order.indexOf(a[0]));
+    const fin = final.has(cat) ? final.get(cat) : null;
+    if (!cards.length && !fin) continue;
+    out.rows.push({ category: cat, label: CATEGORY_NAMES[cat], cards, next: cards.length / unseen.length, final: fin });
+  }
+  return out;
 }
