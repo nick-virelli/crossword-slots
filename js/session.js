@@ -1,21 +1,25 @@
-// Crossword Slots — session state machine. Runs on the host's phone only.
-// The state is a plain JSON object so it can be saved, restored and handed to a new host.
+// Crossword Slots — state machine for one "game" (a sitting of many rounds). Runs on the
+// host's phone only. The state is a plain JSON object so it can be saved, restored and handed
+// to a new host.
+//
+// Words: a GAME is the whole sitting, from creating the room to settle-up. A ROUND is one
+// deal of the deck. (In the code the game is the session object `s`, the round is `s.game`.)
 //
 // A "device" is a phone (did). A "player" is a name with a balance (id). Phones check in
 // as a player and can switch, so a player's seat and balance never depend on one phone.
 
 import {
   CARRY_ID, DEFAULT_RULES, makeDeck, shuffle, planGame, dealGame, boardsOf, resolveBoards,
-  autoDiscard, settleUp, splitEven, boardLabel, playMode, needsDiscard, variantName, handName,
-} from './engine.js?v=1794813247';
-import { computeOdds } from './odds.js?v=1794813247';
+  autoDiscard, settleUp, splitEven, boardLabel, playMode, needsDiscard, variantName, handName, money,
+} from './engine.js?v=1794870668';
+import { computeOdds } from './odds.js?v=1794870668';
 
-const STAGE_COLS = { pre: 0, flop: 3, turn: 4, river: 5, showdown: 5, done: 5 };
+export const SESSION_VERSION = 3;
 export const POCKET_NAME = 'The Pocket';
 
 export function newSession(code, hostDid, hostName) {
   const s = {
-    v: 2,
+    v: SESSION_VERSION,
     code,
     startedAt: Date.now(),
     hostId: null,
@@ -25,6 +29,9 @@ export function newSession(code, hostDid, hostName) {
     seq: 0,
     botSeq: 0,
     rules: { ...DEFAULT_RULES },
+    stepReveal: false,   // false: one tap reveals a whole street; true: one board per tap
+    dealerRotate: false, // true: the deal (and the choice of rules) passes around the table
+    dealerId: null,
     carry: Array(10).fill(0),
     phase: 'lobby', // lobby | play | ended
     game: null,
@@ -32,8 +39,10 @@ export function newSession(code, hostDid, hostName) {
     log: [],
     refund: null,
     settle: null,
+    awards: null,
   };
   s.hostId = addPlayer(s, hostName, false);
+  s.dealerId = s.hostId;
   s.devices[hostDid] = s.hostId;
   return s;
 }
@@ -48,6 +57,35 @@ export const deviceOf = (s, id) => Object.keys(s.devices).find((d) => s.devices[
 const err = (error) => ({ error });
 const OK = { ok: true };
 
+// Who runs the round (chooses rules, deals, reveals). Normally the host; with a rotating
+// deal it is the current dealer. The host can always step in.
+export function controller(s) {
+  const d = s.dealerRotate ? byId(s, s.dealerId) : null;
+  return d && d.active && !d.bot ? d.id : s.hostId;
+}
+export const canControl = (s, id) => !!id && (id === s.hostId || id === controller(s));
+
+function rotateDealer(s) {
+  const seats = s.players.filter((p) => p.active && !p.bot && !p.sitOut);
+  if (!seats.length) { s.dealerId = s.hostId; return; }
+  const all = s.players.map((p) => p.id);
+  const from = all.indexOf(s.dealerId);
+  for (let k = 1; k <= all.length; k++) {
+    const id = all[(from + k) % all.length];
+    if (seats.some((p) => p.id === id)) { s.dealerId = id; return; }
+  }
+}
+
+export function setOption(s, patch) {
+  if (typeof patch.stepReveal === 'boolean') s.stepReveal = patch.stepReveal;
+  if (typeof patch.dealerRotate === 'boolean') {
+    if (inProgress(s)) return err('Change this between rounds.');
+    s.dealerRotate = patch.dealerRotate;
+    if (!byId(s, s.dealerId)) s.dealerId = s.hostId;
+  }
+  return OK;
+}
+
 export function addPlayer(s, name, bot = false) {
   s.seq += 1;
   const id = `${bot ? 'b' : 'p'}${s.seq}`;
@@ -56,7 +94,7 @@ export function addPlayer(s, name, bot = false) {
 }
 
 export function addBot(s) {
-  if (s.phase === 'ended') return err('This session has ended.');
+  if (s.phase === 'ended') return err('This game has ended.');
   s.botSeq += 1;
   addPlayer(s, `CPU ${s.botSeq}`, true);
   return OK;
@@ -68,15 +106,15 @@ function release(s, did) {
   if (!id) return;
   delete s.devices[did];
   const p = byId(s, id);
-  const inGame = inProgress(s) && s.game.order.includes(id);
-  if (p && !p.played && p.balance === 0 && !inGame && id !== s.hostId) {
+  const inRound = inProgress(s) && s.game.order.includes(id);
+  if (p && !p.played && p.balance === 0 && !inRound && id !== s.hostId) {
     s.players = s.players.filter((x) => x.id !== id);
   }
 }
 
 // A phone checks in: as an existing player (pick.id) or by name (pick.name).
 export function claim(s, did, pick) {
-  if (s.phase === 'ended') return err('This session has ended.');
+  if (s.phase === 'ended') return err('This game has ended.');
   if (did === s.hostDid) return err('The host stays as the host. Pass the host to someone else first.');
   let p = null;
   if (pick && pick.id) {
@@ -110,13 +148,15 @@ export function unclaim(s, did) {
 }
 
 export function removePlayer(s, id) {
-  if (id === s.hostId) return err("The host can't leave. Pass the host or end the session instead.");
-  if (inProgress(s) && s.game.order.includes(id)) return err('Wait until this game finishes.');
+  if (id === s.hostId) return err("The host can't leave. Pass the host or end the game instead.");
+  if (inProgress(s) && s.game.order.includes(id)) return err('Wait until this round finishes.');
   const p = byId(s, id);
   if (!p) return OK;
   for (const d of Object.keys(s.devices)) if (s.devices[d] === id) delete s.devices[d];
+  if (s.dealerId === id) rotateDealer(s);
   if (p.balance === 0 && !p.played) s.players = s.players.filter((x) => x.id !== id);
   else p.active = false; // keep them in the ledger for settle-up
+  if (!byId(s, s.dealerId) || s.dealerId === id) s.dealerId = s.hostId;
   return OK;
 }
 
@@ -124,6 +164,7 @@ export function setSitOut(s, id, on) {
   const p = byId(s, id);
   if (!p) return err("That player isn't in this room.");
   p.sitOut = !!on;
+  if (p.sitOut && s.dealerId === id && !inProgress(s)) rotateDealer(s);
   return OK;
 }
 
@@ -137,7 +178,7 @@ export function passHost(s, toId) {
 }
 
 export function setRules(s, patch) {
-  if (s.phase !== 'lobby') return err('Rules can only change between games.');
+  if (s.phase !== 'lobby') return err('Rules can only change between rounds.');
   if (typeof patch.showOdds === 'boolean') { // a display setting, never locked
     s.rules = { ...s.rules, showOdds: patch.showOdds };
     return OK;
@@ -159,17 +200,22 @@ export function oddsOn(s) {
   return s.rules.showOdds || playing(s).filter((p) => !p.bot).length <= 1;
 }
 
+// ---------- what is face up ----------
+
+// Cards come out in deal order: every board's flop (3 each), then each turn, then each river.
+const dealIndex = (rows, r, c) => (c < 3 ? r * 3 + c : c === 3 ? 3 * rows + r : 4 * rows + r);
+const isUp = (g, r, c) => dealIndex(g.plan.rows, r, c) < g.shown;
+
 function knownBoards(g) {
-  const cols = STAGE_COLS[g.stage];
-  const rows = g.grid.map((row) => row.slice(0, cols));
+  const rows = g.grid.map((row, r) => row.filter((_, c) => isUp(g, r, c)));
   if (g.rules.layout !== 'crossword') return rows;
   const down = [];
-  for (let c = 0; c < 5; c++) down.push(c < cols ? g.grid.map((row) => row[c]) : []);
+  for (let c = 0; c < 5; c++) down.push(g.grid.map((row) => row[c]).filter((_, r) => isUp(g, r, c)));
   return [...rows, ...down];
 }
 
 const discardStage = (g) => (g.rules.discardTiming === 'pre' ? 'pre' : 'flop');
-const discardOpen = (g) => needsDiscard(g.rules) && g.stage === discardStage(g);
+const discardOpen = (g) => needsDiscard(g.rules) && g.stage === discardStage(g) && (g.stage === 'flop' || g.shown === 0);
 const pendingDiscards = (g) => (discardOpen(g) ? g.order.filter((id) => g.discard[id] === undefined) : []);
 const discardsDone = (g) => !needsDiscard(g.rules) || g.order.every((id) => g.discard[id] !== undefined);
 const keptCards = (hole, idx) => (idx === undefined ? hole : hole.filter((_, k) => k !== idx));
@@ -180,19 +226,30 @@ function handsOf(g) {
   return hands;
 }
 
-function refreshOdds(s, rnd) {
+function unseenBy(g) {
+  const gone = new Set([...Object.values(g.hole).flat(), ...(g.carryHole || [])]);
+  g.grid.forEach((row, r) => row.forEach((card, c) => { if (isUp(g, r, c)) gone.add(card); }));
+  if (g.burn) gone.add(g.burn);
+  return makeDeck().filter((c) => !gone.has(c));
+}
+
+function refreshOdds(s) {
   const g = s.game;
   if (!g || !['pre', 'flop', 'turn', 'river'].includes(g.stage)) return;
   g.odds = null;
   if (!oddsOn(s) || !discardsDone(g)) return; // Pineapple: wait until everyone has discarded
-  const cols = STAGE_COLS[g.stage];
-  const gone = new Set([...Object.values(g.hole).flat(), ...(g.carryHole || []), ...g.grid.flatMap((row) => row.slice(0, cols))]);
-  if (g.burn) gone.add(g.burn);
-  const unseen = makeDeck().filter((c) => !gone.has(c));
-  const boards = computeOdds(handsOf(g), playMode(g.rules), knownBoards(g), unseen, rnd);
+  const boards = computeOdds(handsOf(g), playMode(g.rules), knownBoards(g), unseenBy(g));
   const ev = {};
   boards.forEach((b, i) => { for (const id of Object.keys(b)) ev[id] = (ev[id] || 0) + b[id] * g.plan.pots[i]; });
   g.odds = { boards, ev };
+}
+
+// Each hand's chance on any one board before a single board card is dealt. Every board is
+// the same at that point, so one number per hand. Kept for the results and the luck stats.
+function capturePre(s) {
+  const g = s.game;
+  if (g.pre) return;
+  g.pre = computeOdds(handsOf(g), playMode(g.rules), [[]], unseenBy(g))[0];
 }
 
 function openDiscards(s) {
@@ -206,8 +263,8 @@ function openDiscards(s) {
 }
 
 export function deal(s, rnd) {
-  if (s.phase === 'ended') return err('This session has ended.');
-  if (inProgress(s)) return err('A game is already running.');
+  if (s.phase === 'ended') return err('This game has ended.');
+  if (inProgress(s)) return err('A round is already running.');
   const players = playing(s);
   const plan = planGame(s.rules, players.length, s.carry);
   if (!plan.ok) return err(plan.reason);
@@ -228,10 +285,12 @@ export function deal(s, rnd) {
     discard: {},
     carryDiscard: undefined,
     stage: 'pre',
+    shown: 0,
     payIndex: 0,
     results: null,
     net: null,
     odds: null,
+    pre: null,
   };
   s.phase = 'play';
   if (discardOpen(s.game)) openDiscards(s);
@@ -242,7 +301,7 @@ export function deal(s, rnd) {
 export function discard(s, id, idx) {
   const g = s.game;
   if (!g || s.phase !== 'play' || !discardOpen(g)) return err('No discard is open right now.');
-  if (!g.order.includes(id)) return err("You're not in this game.");
+  if (!g.order.includes(id)) return err("You're not in this round.");
   if (g.discard[id] !== undefined) return err('You already discarded.');
   if (!Number.isInteger(idx) || idx < 0 || idx > 4) return err('Pick one of your five cards.');
   g.discard[id] = idx;
@@ -280,53 +339,110 @@ function showdown(s) {
     for (const w of r.winners) if (w.id === CARRY_ID) carry[r.index] += w.cents;
   }
   s.carry = carry;
+
+  // round stats for the history and the awards
+  const total = g.plan.pots.reduce((a, b) => a + b, 0);
+  let best = null;
+  let big = null;
+  for (const r of results) {
+    for (const x of r.all) {
+      if (x.id !== CARRY_ID && (!best || x.score > best.score)) best = { name: byId(s, x.id).name, score: x.score, handName: handName(x.score) };
+    }
+    for (const w of r.winners) {
+      if (w.id !== CARRY_ID && (!big || w.cents > big.cents)) big = { name: byId(s, w.id).name, cents: w.cents, label: boardLabel(g.rules.layout, r.index) };
+    }
+  }
   s.log.push({
     no: g.no,
     line: rulesLine(g.rules, g.plan.rows),
     net: g.order.map((id) => ({ name: byId(s, id).name, cents: g.net[id], bot: byId(s, id).bot })),
-    online: g.order.filter((id) => !byId(s, id).bot).length >= 2, // only games between people count long-term
+    online: g.order.filter((id) => !byId(s, id).bot).length >= 2, // only rounds between people count long-term
     carried: carry.reduce((a, b) => a + b, 0),
+    // luck = what they actually won minus what their starting cards were worth on average
+    stats: g.order.map((id) => {
+      const exp = Math.round(((g.pre && g.pre[id]) || 0) * total);
+      return {
+        name: byId(s, id).name,
+        bot: byId(s, id).bot,
+        boards: results.filter((r) => r.winners.some((w) => w.id === id)).length,
+        exp,
+        luck: deltas[id] - exp,
+      };
+    }),
+    best,
+    big,
   });
   g.stage = 'showdown';
   g.payIndex = 1;
 }
 
-// The host's single "next" button.
+// The dealer's single "next" button. Every tap is deliberate: nothing advances on a timer.
 export function advance(s) {
   const g = s.game;
-  if (!g || s.phase !== 'play') return err('No game is running.');
+  if (!g || s.phase !== 'play') return err('No round is running.');
   if (pendingDiscards(g).length) return err('Still waiting for discards.');
-  switch (g.stage) {
-    case 'pre':
-      g.stage = 'flop';
-      if (discardOpen(g)) openDiscards(s);
-      break;
-    case 'flop': g.stage = 'turn'; break;
-    case 'turn': g.stage = 'river'; break;
-    case 'river': showdown(s); break;
-    case 'showdown':
-      if (g.payIndex < g.plan.nBoards) g.payIndex += 1;
-      else g.stage = 'done';
-      break;
-    default: return err('This game is over.');
+  const R = g.plan.rows;
+  if (g.stage === 'done') return err('This round is over.');
+  if (g.stage === 'showdown') {
+    if (g.payIndex < g.plan.nBoards) g.payIndex += 1;
+    else {
+      g.stage = 'done';
+      if (s.dealerRotate) rotateDealer(s);
+    }
+    return OK;
   }
+  if (g.shown >= 5 * R) { showdown(s); return OK; }
+  if (g.shown === 0) capturePre(s);
+  const bound = [3 * R, 4 * R, 5 * R].find((b) => b > g.shown);
+  g.shown = s.stepReveal ? Math.min(bound, g.shown + (g.shown < 3 * R ? 3 : 1)) : bound;
+  if (g.shown === 3 * R) { g.stage = 'flop'; if (discardOpen(g)) openDiscards(s); }
+  else if (g.shown === 4 * R) g.stage = 'turn';
+  else if (g.shown === 5 * R) g.stage = 'river';
   refreshOdds(s);
   return OK;
 }
 
 export function toLobby(s) {
-  if (s.phase === 'ended') return err('This session has ended.');
-  if (inProgress(s)) return err('Finish this game first.');
+  if (s.phase === 'ended') return err('This game has ended.');
+  if (inProgress(s)) return err('Finish this round first.');
   s.phase = 'lobby';
   return OK;
 }
 
+export function computeAwards(log) {
+  const per = new Map();
+  let big = null;
+  let best = null;
+  for (const l of log) {
+    for (const st of l.stats || []) {
+      const p = per.get(st.name) || { name: st.name, boards: 0, luck: 0 };
+      p.boards += st.boards;
+      p.luck += st.luck;
+      per.set(st.name, p);
+    }
+    if (l.big && (!big || l.big.cents > big.cents)) big = { ...l.big, no: l.no };
+    if (l.best && (!best || l.best.score > best.score)) best = { ...l.best, no: l.no };
+  }
+  const list = [...per.values()];
+  if (!list.length) return [];
+  const most = list.reduce((a, b) => (b.boards > a.boards ? b : a));
+  const lucky = list.reduce((a, b) => (b.luck > a.luck ? b : a));
+  const unlucky = list.reduce((a, b) => (b.luck < a.luck ? b : a));
+  const out = [];
+  if (big) out.push({ title: 'Biggest board', name: big.name, detail: `${money(big.cents)} on ${big.label}, round ${big.no}` });
+  if (most.boards > 0) out.push({ title: 'Most boards won', name: most.name, detail: `${most.boards} board${most.boards === 1 ? '' : 's'}` });
+  if (best) out.push({ title: 'Best hand', name: best.name, detail: `${best.handName}, round ${best.no}` });
+  if (lucky.luck > 0) out.push({ title: 'Luckiest', name: lucky.name, detail: `Won ${money(lucky.luck)} more than their cards were worth` });
+  if (unlucky.luck < 0) out.push({ title: 'Unluckiest', name: unlucky.name, detail: `Won ${money(-unlucky.luck)} less than their cards were worth` });
+  return out;
+}
+
 export function endSession(s) {
   if (s.phase === 'ended') return OK;
-  if (inProgress(s)) return err('Finish this game first.');
+  if (inProgress(s)) return err('Finish this round first.');
   const total = s.carry.reduce((a, b) => a + b, 0);
   if (total > 0) {
-    // Carried chips must never be lost: hand them back to the players of the last game.
+    // Carried chips must never be lost: hand them back to the players of the last round.
     const ids = s.game ? s.game.order : playing(s).map((p) => p.id);
     const shares = splitEven(total, ids.length);
     ids.forEach((id, k) => { byId(s, id).balance += shares[k]; });
@@ -339,6 +455,7 @@ export function endSession(s) {
     s.carry = Array(10).fill(0);
   }
   s.settle = settleUp(s.players.map((p) => ({ id: p.id, name: p.name, cents: p.balance })));
+  s.awards = computeAwards(s.log);
   s.phase = 'ended';
   return OK;
 }
@@ -362,6 +479,9 @@ export function viewFor(s, pid, online = new Set(), extra = {}) {
     code: s.code,
     phase: s.phase,
     hostId: s.hostId,
+    control: controller(s),
+    dealerRotate: s.dealerRotate,
+    stepReveal: s.stepReveal,
     you: me ? me.id : null,
     sitOut: !!me && me.sitOut,
     rules: s.rules,
@@ -384,6 +504,7 @@ export function viewFor(s, pid, online = new Set(), extra = {}) {
     log: s.log.filter((l) => !paying || l.no !== g.no),
     settle: s.settle,
     refund: s.refund,
+    awards: s.awards,
     past: extra.past || [],
     totals: extra.totals || [],
     roster: extra.roster || [],
@@ -393,21 +514,26 @@ export function viewFor(s, pid, online = new Set(), extra = {}) {
     ? { ok: true, notes: plan.notes, rows: plan.rows, nBoards: plan.nBoards, perPlayer: plan.perPlayer, total: plan.total, base: plan.base, pots: plan.pots }
     : { ok: false, reason: plan.reason, notes: plan.notes };
   if (g && s.phase !== 'lobby') {
-    const cols = STAGE_COLS[g.stage];
+    const R = g.plan.rows;
     const shown = g.stage === 'showdown' || g.stage === 'done';
     const mine = me ? g.hole[me.id] : null;
     const total = g.plan.pots.reduce((a, b) => a + b, 0);
+    const street = g.shown < 3 * R ? 'flop' : g.shown < 4 * R ? 'turn' : g.shown < 5 * R ? 'river' : null;
+    const base = street === 'flop' ? 0 : street === 'turn' ? 3 * R : 4 * R;
     view.game = {
       no: g.no,
       rules: g.rules,
-      rows: g.plan.rows,
+      rows: R,
       nBoards: g.plan.nBoards,
       labels: Array.from({ length: g.plan.nBoards }, (_, i) => boardLabel(g.rules.layout, i)),
       pots: g.plan.pots,
       carryIn: g.carryIn,
       perPlayer: g.plan.perPlayer,
       stage: g.stage,
-      grid: g.grid.map((row) => row.map((c, k) => (k < cols ? c : null))),
+      shown: g.shown,
+      // what the next tap reveals: which street, which board comes next, and whether the street has started
+      next: street ? { street, board: street === 'flop' ? g.shown / 3 : g.shown - base, started: g.shown > base } : null,
+      grid: g.grid.map((row, r) => row.map((c, k) => (isUp(g, r, k) ? c : null))),
       myHole: mine || null,
       myDiscard: mine && g.discard[me.id] !== undefined ? g.discard[me.id] : null,
       needDiscard: !!me && pending.includes(me.id),
@@ -435,10 +561,17 @@ export function viewFor(s, pid, online = new Set(), extra = {}) {
         label: boardLabel(g.rules.layout, r.index),
         pot: r.pot,
         handName: r.handName,
-        winners: r.winners.map((w) => ({ id: w.id, name: nameOf(w.id), cents: w.cents, cards: w.cards })),
+        // pre = their chance on a board before any board card was dealt
+        winners: r.winners.map((w) => ({ id: w.id, name: nameOf(w.id), cents: w.cents, cards: w.cards, pre: g.pre ? g.pre[w.id] : null })),
         all: r.all.map((x) => ({ id: x.id, name: nameOf(x.id), handName: handName(x.score), cards: x.cards })),
       }));
-      if (g.stage === 'done') view.game.net = g.order.map((id) => ({ id, name: nameOf(id), cents: g.net[id] }));
+      if (g.stage === 'done') {
+        const log = s.log.find((l) => l.no === g.no);
+        view.game.net = g.order.map((id) => {
+          const st = log ? log.stats.find((x) => x.name === byId(s, id).name) : null;
+          return { id, name: nameOf(id), cents: g.net[id], luck: st ? st.luck : 0, pre: g.pre ? g.pre[id] : null };
+        });
+      }
     }
   }
   return view;

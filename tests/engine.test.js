@@ -8,7 +8,8 @@ import {
 import { computeOdds, outlook } from '../js/odds.js';
 import {
   newSession, addBot, claim, unclaim, removePlayer, setSitOut, passHost, setRules, deal, discard,
-  autoDiscardRest, advance, toLobby, endSession, viewFor, carryLocked, oddsOn,
+  autoDiscardRest, advance, toLobby, endSession, viewFor, carryLocked, oddsOn, setOption, controller,
+  canControl, computeAwards,
 } from '../js/session.js';
 
 const h = (s) => s.split(' ');
@@ -644,4 +645,112 @@ test('the host can be passed to another phone and the state survives a copy', ()
   assert.equal(chipTotal(moved), 0);
   assert.match(removePlayer(moved, pat).error, /host/);
   assert.deepEqual(removePlayer(moved, 'p1'), { ok: true }); // the old host is now an ordinary player
+});
+
+test('one board at a time: each tap reveals one board, in deal order', () => {
+  const s = newSession('TEST', 'hostDev', 'Host');
+  addBot(s);
+  setRules(s, { hole: 2, layout: 'slots', boards: 3 });
+  setOption(s, { stepReveal: true });
+  deal(s, seeded(21));
+  const up = () => viewFor(s, 'p1').game.grid.map((row) => row.filter(Boolean).length);
+  assert.deepEqual(up(), [0, 0, 0]);
+  assert.deepEqual(viewFor(s, 'p1').game.next, { street: 'flop', board: 0, started: false });
+  advance(s); assert.deepEqual(up(), [3, 0, 0]);
+  assert.equal(s.game.stage, 'pre'); // the flop is not finished yet
+  assert.deepEqual(viewFor(s, 'p1').game.next, { street: 'flop', board: 1, started: true });
+  // odds follow the cards actually showing
+  const odds = viewFor(s, 'p1').game.odds.boards;
+  assert.ok(Math.abs(odds[1][0].share + odds[1][1].share - 1) < 1e-9);
+  advance(s); advance(s); assert.deepEqual(up(), [3, 3, 3]);
+  assert.equal(s.game.stage, 'flop');
+  advance(s); assert.deepEqual(up(), [4, 3, 3]);
+  // switching back mid-street finishes the street in one tap
+  setOption(s, { stepReveal: false });
+  advance(s); assert.deepEqual(up(), [4, 4, 4]);
+  assert.equal(s.game.stage, 'turn');
+  advance(s); assert.deepEqual(up(), [5, 5, 5]);
+  advance(s); assert.equal(s.game.stage, 'showdown');
+  // the showdown never moves by itself: one tap per board
+  assert.equal(s.game.payIndex, 1);
+  advance(s); assert.equal(s.game.payIndex, 2);
+  advance(s); advance(s);
+  assert.equal(s.game.stage, 'done');
+  assert.equal(chipTotal(s), 0);
+});
+
+test('one board at a time works with Pineapple discards after the flop', () => {
+  const s = newSession('TEST', 'hostDev', 'Host');
+  const pat = join(s, 'devA', 'Pat');
+  setRules(s, { hole: 5, layout: 'crossword', carryover: true, discardTiming: 'post' });
+  setOption(s, { stepReveal: true });
+  deal(s, seeded(22));
+  for (let k = 0; k < 5; k++) { assert.equal(viewFor(s, pat).game.needDiscard, false); advance(s); }
+  assert.equal(s.game.stage, 'flop');
+  assert.equal(viewFor(s, pat).game.needDiscard, true);
+  assert.match(advance(s).error, /discards/);
+  discard(s, 'p1', 0); discard(s, pat, 4);
+  let guard = 0;
+  while (s.game.stage !== 'done') { assert.deepEqual(advance(s), { ok: true }); assert.ok(guard++ < 40); }
+  assert.equal(chipTotal(s), 0);
+});
+
+test('the deal can pass around the table, and the dealer runs the round', () => {
+  const s = newSession('TEST', 'hostDev', 'Nick');
+  const pat = join(s, 'devA', 'Pat');
+  addBot(s);
+  const sam = join(s, 'devB', 'Sam');
+  assert.equal(controller(s), 'p1');
+  assert.equal(canControl(s, pat), false);
+  setOption(s, { dealerRotate: true });
+  assert.equal(controller(s), 'p1');
+  const run = () => { deal(s, seeded(30 + s.gameNo)); while (s.game.stage !== 'done') advance(s); };
+  run();
+  assert.equal(controller(s), pat); // passes to the next person
+  assert.equal(canControl(s, pat), true);
+  assert.equal(canControl(s, 'p1'), true); // the host can always step in
+  assert.equal(canControl(s, sam), false);
+  assert.equal(viewFor(s, sam).control, pat);
+  run();
+  assert.equal(controller(s), sam); // CPU players never deal
+  setSitOut(s, 'p1', true);
+  run();
+  assert.equal(controller(s), pat); // people sitting out are skipped
+  removePlayer(s, pat);
+  assert.equal(controller(s), sam);
+  setOption(s, { dealerRotate: false });
+  assert.equal(controller(s), 'p1');
+});
+
+test('results carry the before-the-flop chance, and luck adds up', () => {
+  const s = newSession('TEST', 'hostDev', 'Nick');
+  const pat = join(s, 'devA', 'Pat');
+  setRules(s, { hole: 4, layout: 'slots', boards: 5, carryover: true, stakeCents: 500 });
+  setRules(s, { showOdds: false });
+  const rnd = seeded(40);
+  for (let k = 0; k < 6; k++) {
+    deal(s, rnd);
+    while (s.game.stage !== 'done') advance(s);
+    const g = s.game;
+    const pre = Object.values(g.pre).reduce((a, b) => a + b, 0);
+    assert.ok(Math.abs(pre - 1) < 1e-9); // the two players and the Pocket share 100%
+    const v = viewFor(s, pat);
+    for (const r of v.game.results) for (const w of r.winners) assert.ok(w.pre > 0 && w.pre < 1);
+    const st = s.log[k].stats;
+    assert.equal(st.length, 2);
+    // expected + luck is exactly what each player won
+    const won = (id) => g.results.reduce((a, r) => a + r.winners.filter((w) => w.id === id).reduce((x, w) => x + w.cents, 0), 0);
+    assert.equal(st[0].exp + st[0].luck, won('p1'));
+    assert.equal(st[1].exp + st[1].luck, won(pat));
+    assert.equal(v.game.net[0].luck, st[0].luck);
+    assert.ok(s.log[k].best.handName.length > 0);
+  }
+  endSession(s);
+  const titles = s.awards.map((a) => a.title);
+  assert.ok(titles.includes('Best hand') && titles.includes('Most boards won') && titles.includes('Biggest board'));
+  const luck = new Map();
+  for (const l of s.log) for (const x of l.stats) luck.set(x.name, (luck.get(x.name) || 0) + x.luck);
+  const unlucky = s.awards.find((a) => a.title === 'Unluckiest');
+  if (unlucky) assert.equal(luck.get(unlucky.name), Math.min(...luck.values()));
+  assert.deepEqual(computeAwards([]), []);
 });

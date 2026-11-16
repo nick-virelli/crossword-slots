@@ -1,13 +1,14 @@
 // Crossword Slots — phone UI and real-time sync.
 // The host's phone runs the game (session.js) and sends every other phone only what
 // that player is allowed to see. Phones talk directly to each other through PeerJS.
+//
+// Words: a GAME is the whole sitting; a ROUND is one deal of the deck.
 
-import * as S from './session.js?v=1794813247';
-import { cryptoRnd, money, variantName, CARRY_ID, makeDeck, playMode } from './engine.js?v=1794813247';
-import { outlook } from './odds.js?v=1794813247';
+import * as S from './session.js?v=1794870668';
+import { cryptoRnd, money, variantName, CARRY_ID, makeDeck, playMode } from './engine.js?v=1794870668';
+import { outlook } from './odds.js?v=1794870668';
 
 const PEER_PREFIX = 'xwslots-v1-';
-const PAY_MS = 3200;
 const AWAY_MSG = 'The host is away. The game is paused until they come back.';
 const $app = document.getElementById('app');
 const $toast = document.getElementById('toast');
@@ -37,10 +38,93 @@ const conns = new Map(); // host only: device id -> { conn, last }
 let net = { status: 'idle', msg: '' };
 let lastMsg = 0;
 let retryTimer = null;
-let autoTimer = null;
 let handover = null;  // host only: a pass-the-host in flight
 let wake = null;
-const ui = { sel: null, seenGame: 0, seen: new Set(), board: null };
+const ui = { sel: null, seenGame: 0, seen: new Set(), board: null, sheet: null };
+
+// ---------- this phone's own settings: look, deck colours, sound ----------
+
+// TEMPORARY: five complete looks to choose between. Once one is picked, delete the others
+// from style.css, remove the Look picker from the settings sheet, and hard-code the winner.
+const THEMES = [['felt', 'Felt'], ['paper', 'Newsprint'], ['mono', 'Terminal'], ['neon', 'Neon'], ['block', 'Block']];
+const prefs = { theme: 'felt', deck4: false, sound: true, ...(ls.json('xw_prefs') || {}) };
+function applyPrefs() {
+  if (!THEMES.some((t) => t[0] === prefs.theme)) prefs.theme = 'felt';
+  document.documentElement.dataset.theme = prefs.theme;
+  document.documentElement.dataset.deck = prefs.deck4 ? '4' : '2';
+  ls.set('xw_prefs', JSON.stringify(prefs));
+}
+applyPrefs();
+
+// ---------- sound and vibration ----------
+// Every bit of feedback goes through fx(name). When a new game event is added (a new mode,
+// a new button with a consequence, a new kind of result) give it an entry here and trigger it
+// from diffFx() so nothing in the game is silent while the rest makes noise.
+const FX = {
+  deal: { tone: [[220, 0.05, 'triangle'], [330, 0.05, 'triangle'], [440, 0.09, 'triangle']], vib: [20] },
+  flip: { tone: [[1150, 0.035, 'square', 0.03]], vib: [8] },
+  discard: { tone: [[660, 0.08], [880, 0.14]], vib: [40, 60, 40] },           // your turn to discard
+  pay: { tone: [[520, 0.08, 'triangle', 0.05]], vib: [] },                     // a board paid to someone else
+  win: { tone: [[523, 0.09], [659, 0.09], [784, 0.18]], vib: [30, 40, 70] },   // you won a board
+  pocket: { tone: [[392, 0.12, 'sawtooth', 0.05], [311, 0.12, 'sawtooth', 0.05], [233, 0.28, 'sawtooth', 0.05]], vib: [80, 50, 80] }, // the Pocket took a board
+  done: { tone: [[440, 0.08], [554, 0.1]], vib: [] },                          // round finished
+  yourDeal: { tone: [[587, 0.08], [740, 0.08], [880, 0.14]], vib: [30, 30, 30] }, // the deal passed to you
+  end: { tone: [[523, 0.1], [659, 0.1], [784, 0.1], [1047, 0.3]], vib: [50, 50, 120] }, // game over, settle up
+};
+let actx = null;
+function fx(name, times = 1) {
+  const f = FX[name];
+  if (!f || !prefs.sound) return;
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+    for (let k = 0; k < times; k++) {
+      let t = actx.currentTime + k * 0.07;
+      for (const [freq, dur, type = 'sine', vol = 0.08] of f.tone) {
+        const o = actx.createOscillator();
+        const g = actx.createGain();
+        o.type = type;
+        o.frequency.value = freq;
+        g.gain.setValueAtTime(vol, t);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        o.connect(g).connect(actx.destination);
+        o.start(t);
+        o.stop(t + dur);
+        t += dur * 0.9;
+      }
+    }
+  } catch { /* no audio on this phone */ }
+  try { if (f.vib.length && navigator.vibrate) navigator.vibrate(f.vib); } catch { /* no vibration */ }
+}
+
+// Works out what just happened by comparing the screen before and after.
+function diffFx(prev, next) {
+  if (!prev || !next) return;
+  if (prev.phase !== 'ended' && next.phase === 'ended') { fx('end'); return; }
+  if (next.dealerRotate && prev.control !== next.control && next.control === next.you) fx('yourDeal');
+  const pg = prev.game;
+  const ng = next.game;
+  if (!ng || next.phase !== 'play') return;
+  if (!pg || pg.no !== ng.no || prev.phase !== 'play') { fx('deal'); if (ng.needDiscard) fx('discard'); return; }
+  if (ng.shown > pg.shown) fx('flip', Math.min(5, ng.shown - pg.shown));
+  const before = pg.results ? pg.results.length : 0;
+  const after = ng.results ? ng.results.length : 0;
+  if (after > before && ng.stage === 'showdown') {
+    const r = ng.results[after - 1];
+    if (r.winners.some((w) => w.id === next.you)) fx('win');
+    else if (r.winners.some((w) => w.id === CARRY_ID)) fx('pocket');
+    else fx('pay');
+  }
+  if (pg.stage !== 'done' && ng.stage === 'done') fx('done');
+  if (!pg.needDiscard && ng.needDiscard) fx('discard');
+}
+
+function setView(v) {
+  const prev = view;
+  view = v;
+  diffFx(prev, v);
+  render();
+}
 
 // ---------- helpers ----------
 
@@ -55,15 +139,16 @@ function toast(msg) {
 }
 
 function cardHtml(c, cls = '', attrs = '') {
-  const red = c[1] === 'd' || c[1] === 'h';
   const rank = c[0] === 'T' ? '10' : c[0];
-  return `<div class="card ${red ? 'red' : ''} ${cls}" ${attrs}><span class="r">${rank}</span><span class="s">${SUIT[c[1]]}</span></div>`;
+  return `<div class="card s-${c[1]} ${cls}" ${attrs}><span class="r">${rank}</span><span class="s">${SUIT[c[1]]}</span></div>`;
 }
 const mini = (cards) => `<span class="mini">${cards.map((c) => cardHtml(c)).join('')}</span>`;
 const balHtml = (c) => `<span class="bal ${c > 0 ? 'pos' : c < 0 ? 'neg' : ''}">${c > 0 ? '+' : ''}${money(c)}</span>`;
+const signed = (c) => `${c > 0 ? '+' : ''}${money(c)}`;
 const joinUrl = () => `${location.origin}${location.pathname}?room=${roomCode}`;
 const hasPeer = () => typeof window.Peer === 'function';
 const labelFor = (layout, i) => (layout === 'crossword' ? (i < 5 ? `${i + 1} Across` : `${i - 4} Down`) : `Board ${i + 1}`);
+const nameOfPlayer = (id) => ((view && view.players.find((p) => p.id === id)) || { name: 'the host' }).name;
 
 function pct(share) {
   if (share >= 0.995) return '100%';
@@ -89,6 +174,20 @@ async function keepAwake() {
   } catch { /* not supported or refused: the screen may dim as usual */ }
 }
 
+// A QR code for the join link, drawn on this phone (no outside service).
+function qrSvg(text) {
+  if (typeof window.qrcode !== 'function') return '';
+  try {
+    const q = window.qrcode(0, 'M');
+    q.addData(text);
+    q.make();
+    const n = q.getModuleCount();
+    let path = '';
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (q.isDark(r, c)) path += `M${c + 2} ${r + 2}h1v1h-1z`;
+    return `<svg class="qr" viewBox="0 0 ${n + 4} ${n + 4}" role="img" aria-label="QR code to join this room"><rect width="100%" height="100%" fill="#fff"/><path d="${path}" fill="#000"/></svg>`;
+  } catch { return ''; }
+}
+
 // ---------- history kept on the host's phone ----------
 
 let hist = ls.json('xw_hist2') || [];
@@ -100,8 +199,8 @@ function histExtra() {
   for (const h of hist) {
     for (const p of h.players) {
       const k = p.name.toLowerCase();
-      const t = totals.get(k) || { name: p.name, cents: 0, sessions: 0 };
-      t.cents += p.cents; t.sessions += 1; t.name = p.name;
+      const t = totals.get(k) || { name: p.name, cents: 0, luck: 0, sessions: 0 };
+      t.cents += p.cents; t.luck += p.luck || 0; t.sessions += 1; t.name = p.name;
       totals.set(k, t);
     }
   }
@@ -110,18 +209,24 @@ function histExtra() {
   return histCache;
 }
 function saveHist() { hist = hist.slice(-60); ls.set('xw_hist2', JSON.stringify(hist)); histCache = null; }
-// Long-term stats only count games between people. Games against CPU players never count.
+
+// Long-term stats only count rounds between people. Rounds against CPU players never count.
 function recordSession() {
   const id = `${session.code}-${session.startedAt}`;
   if (hist.some((h) => h.id === id)) return;
   const totals = new Map();
-  const add = (n) => { if (!n.bot) totals.set(n.name, (totals.get(n.name) || 0) + n.cents); };
-  const games = session.log.filter((l) => l.online);
-  for (const l of games) l.net.forEach(add);
-  if (!games.length) return;
+  const get = (name) => { if (!totals.has(name)) totals.set(name, { name, cents: 0, luck: 0 }); return totals.get(name); };
+  const rounds = session.log.filter((l) => l.online);
+  if (!rounds.length) return;
+  for (const l of rounds) {
+    for (const n of l.net) if (!n.bot) get(n.name).cents += n.cents;
+    for (const st of l.stats || []) if (!st.bot) get(st.name).luck += st.luck;
+  }
   const last = session.log[session.log.length - 1];
-  if (session.refund && session.refund.shares && last.online) session.refund.shares.forEach(add);
-  hist.push({ id, when: Date.now(), games: games.length, players: [...totals].map(([name, cents]) => ({ name, cents })) });
+  if (session.refund && session.refund.shares && last.online) {
+    for (const n of session.refund.shares) if (!n.bot) get(n.name).cents += n.cents;
+  }
+  hist.push({ id, when: Date.now(), games: rounds.length, players: [...totals.values()] });
   saveHist();
 }
 function mergeHist(other) {
@@ -137,10 +242,6 @@ function saveSession() { ls.set('xw_host', JSON.stringify(session)); }
 function commit() {
   saveSession();
   broadcast();
-  clearTimeout(autoTimer);
-  if (session.phase === 'play' && session.game.stage === 'showdown' && !document.hidden) {
-    autoTimer = setTimeout(() => { S.advance(session); commit(); }, PAY_MS);
-  }
 }
 
 function sendTo(c, msg) {
@@ -155,13 +256,25 @@ function broadcast() {
   }
   const extra = histExtra();
   for (const [d, c] of conns) sendTo(c, { t: 'state', view: S.viewFor(session, S.playerOf(session, d), online, extra) });
-  view = S.viewFor(session, session.hostId, online, extra);
-  render();
+  setView(S.viewFor(session, session.hostId, online, extra));
 }
 
 function hostAct(result) {
   if (result && result.error) toast(result.error);
   commit();
+}
+
+// Things the person running the round may do (the host, or the dealer when the deal rotates).
+function runCtl(a, x) {
+  switch (a) {
+    case 'rule': return S.setRules(session, x && typeof x === 'object' ? x : {});
+    case 'deal': return S.deal(session, cryptoRnd);
+    case 'next': return S.advance(session);
+    case 'autoDiscard': return S.autoDiscardRest(session);
+    case 'lobby': return S.toLobby(session);
+    case 'step': return S.setOption(session, { stepReveal: !!x });
+    default: return { error: 'Unknown action.' };
+  }
 }
 
 function startHost(fresh) {
@@ -205,6 +318,7 @@ function openHostPeer(fresh) {
       else if (m.t === 'leave') { if (pid) { S.unclaim(session, cdid); r = S.removePlayer(session, pid); } else r = {}; }
       else if (m.t === 'discard' && pid) r = S.discard(session, pid, m.idx);
       else if (m.t === 'sit' && pid) r = S.setSitOut(session, pid, !!m.on);
+      else if (m.t === 'ctl' && pid) r = S.canControl(session, pid) ? runCtl(String(m.a), m.x) : { error: "It isn't your deal." };
       else if (m.t === 'takeover-ack' && handover && handover.did === cdid) { finishHandover(); return; }
       if (r) { if (r.error) sendTo(c, { t: 'toast', msg: r.error }); commit(); }
     });
@@ -253,7 +367,6 @@ function startHandover(toId) {
   const copy = JSON.parse(JSON.stringify(session));
   const r = S.passHost(copy, toId);
   if (r.error) { toast(r.error); return; }
-  clearTimeout(autoTimer);
   handover = { did: toDid, timer: setTimeout(() => { handover = null; toast("Couldn't reach their phone. You are still the host."); commit(); }, 7000) };
   sendTo(c, { t: 'takeover', session: copy, hist });
   net = { status: 'connecting', msg: 'Passing the host…' };
@@ -326,11 +439,10 @@ function connectClient() {
       if (peer !== p || !m) return;
       lastMsg = Date.now();
       if (m.t === 'state') {
-        view = m.view;
         net = { status: 'online', msg: '' };
-        const me = view.players.find((x) => x.id === view.you);
+        const me = m.view.players.find((x) => x.id === m.view.you);
         if (me && me.name !== myName) { myName = me.name; ls.set('xw_name', myName); }
-        render();
+        setView(m.view);
       } else if (m.t === 'ping') { try { c.send({ t: 'pong' }); } catch { /* dropped */ } }
       else if (m.t === 'away') { net = { status: 'connecting', msg: AWAY_MSG }; render(); }
       else if (m.t === 'toast') toast(String(m.msg));
@@ -362,7 +474,7 @@ function sendHost(msg) {
 setInterval(() => { hostHeartbeat(); clientHeartbeat(); }, 4000);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
-    if (role === 'host') { clearTimeout(autoTimer); for (const c of conns.values()) sendTo(c, { t: 'away' }); }
+    if (role === 'host') for (const c of conns.values()) sendTo(c, { t: 'away' });
     return;
   }
   keepAwake();
@@ -389,13 +501,23 @@ async function share() {
   try {
     if (navigator.share) { await navigator.share({ title: 'Crossword Slots', text: `Join my Crossword Slots room ${roomCode}`, url }); return; }
   } catch { return; }
+  copyLink();
+}
+async function copyLink() {
+  const url = joinUrl();
   try { await navigator.clipboard.writeText(url); toast('Join link copied.'); }
   catch { window.prompt('Copy this join link:', url); }
 }
 
 const isHost = () => role === 'host';
+// the round is run by the host, or by the dealer when the deal rotates
+function ctl(a, x) {
+  if (isHost()) hostAct(runCtl(a, x));
+  else sendHost({ t: 'ctl', a, x });
+}
 
 const actions = {
+  noop() {},
   create() {
     if (!readName()) return;
     session = S.newSession(newCode(), did, myName);
@@ -410,7 +532,22 @@ const actions = {
   },
   fillName(name) { const el = document.getElementById('name'); if (el) el.value = name; },
   home() { ls.del('xw_room'); location.href = location.pathname; },
+  logo() {
+    if (!role) { location.href = location.pathname; return; }
+    const msg = isHost()
+      ? 'Go back to the start screen? Your room pauses for everyone until you come back and tap Resume.'
+      : 'Go back to the start screen? You can rejoin with the room code and keep your seat.';
+    if (!window.confirm(msg)) return;
+    ls.del('xw_room');
+    location.href = location.pathname;
+  },
+  // sheets: invite, how to play, settings
+  sheet(name) { ui.sheet = name; render(); },
+  closeSheet() { ui.sheet = null; render(); },
   share,
+  copyLink,
+  theme(t) { prefs.theme = t; applyPrefs(); render(); },
+  pref(key, val) { prefs[key] = val === '1'; applyPrefs(); render(); if (key === 'sound' && prefs.sound) fx('win'); },
   // checking in (phones that are not the host)
   claimId(id) { sendHost({ t: 'claim', id }); },
   claimName(name) { sendHost({ t: 'claim', name }); },
@@ -422,16 +559,22 @@ const actions = {
     ls.del('xw_room');
     setTimeout(() => { location.href = location.pathname; }, 200);
   },
-  // host only
+  // running the round (host, or the dealer when the deal rotates)
   rule(key, val) {
-    if (!isHost()) return;
     let patch;
     if (key === 'variant') patch = { hole: parseInt(val, 10), free: val === '5f' };
     else if (key === 'layout' || key === 'discardTiming') patch = { [key]: val };
     else if (key === 'carryover' || key === 'showOdds') patch = { [key]: val === '1' };
     else patch = { [key]: Number(val) };
-    hostAct(S.setRules(session, patch));
+    ctl('rule', patch);
   },
+  deal() { ui.sel = null; ui.board = null; ctl('deal'); },
+  next() { ctl('next'); },
+  autoDiscard() { ctl('autoDiscard'); },
+  lobby() { ctl('lobby'); },
+  step(on) { ctl('step', on === '1'); },
+  // host only
+  option(key, val) { if (isHost()) hostAct(S.setOption(session, { [key]: val === '1' })); },
   addBot() { if (isHost()) hostAct(S.addBot(session)); },
   kick(id) { if (isHost()) hostAct(S.removePlayer(session, id)); },
   makeHost(id) {
@@ -439,12 +582,8 @@ const actions = {
     const p = session.players.find((x) => x.id === id);
     if (p && window.confirm(`Make ${p.name} the host? Their phone will run the game from now on.`)) startHandover(id);
   },
-  deal() { if (isHost()) { ui.sel = null; ui.board = null; hostAct(S.deal(session, cryptoRnd)); } },
-  next() { if (isHost()) hostAct(S.advance(session)); },
-  autoDiscard() { if (isHost()) hostAct(S.autoDiscardRest(session)); },
-  lobby() { if (isHost()) hostAct(S.toLobby(session)); },
   end() {
-    if (!isHost() || !window.confirm('End the session and show the settle-up?')) return;
+    if (!isHost() || !window.confirm('End the game and show the settle-up?')) return;
     const r = S.endSession(session);
     if (!r.error) recordSession();
     hostAct(r);
@@ -474,13 +613,14 @@ $app.addEventListener('click', (e) => {
   if (fn) fn(el.dataset.a, el.dataset.b);
 });
 $app.addEventListener('change', (e) => {
-  if (e.target.id === 'stake' && isHost()) {
+  if (e.target.id === 'stake') {
     const v = Math.round(parseFloat(e.target.value) * 100);
-    if (Number.isFinite(v) && v >= 1) hostAct(S.setRules(session, { stakeCents: v }));
+    if (Number.isFinite(v) && v >= 1) ctl('rule', { stakeCents: v });
     else { toast('Enter a stake above $0.'); render(); }
   }
 });
 $app.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && ui.sheet) { actions.closeSheet(); return; }
   if (e.key !== 'Enter') return;
   if (e.target.id === 'code') actions.join();
   else if (e.target.id === 'name' && view && !view.you) actions.claimNew();
@@ -490,23 +630,28 @@ $app.addEventListener('keydown', (e) => {
 // ---------- rendering ----------
 
 function render() {
-  if (!view) { $app.innerHTML = `<div class="narrow">${renderHome()}</div>`; return; }
-  const host = view.hostId === view.you;
   let body;
-  if (view.phase === 'ended') body = `<div class="narrow">${renderEnded(host)}</div>`;
-  else if (!view.you) body = `<div class="narrow">${renderPicker()}</div>`;
-  else if (view.phase === 'lobby' || !view.game) body = renderLobby(host);
-  else body = renderTable(host);
-  $app.innerHTML = renderHeader() + body;
+  if (!view) body = `<div class="narrow">${renderHome()}</div>`;
+  else {
+    const host = view.hostId === view.you;
+    const ctrl = host || view.control === view.you;
+    if (view.phase === 'ended') body = `<div class="narrow">${renderEnded(host)}</div>`;
+    else if (!view.you) body = `<div class="narrow">${renderPicker()}</div>`;
+    else if (view.phase === 'lobby' || !view.game) body = renderLobby(host, ctrl);
+    else body = renderTable(host, ctrl);
+  }
+  $app.innerHTML = renderHeader() + body + renderSheet();
 }
 
 function renderHeader() {
   const dot = net.status === 'online' ? 'on' : net.status === 'connecting' ? 'wait' : '';
   return `<header>
-    <div class="brand">Crossword <span>Slots</span></div>
-    <button class="chip" data-act="share">Room <b>${esc(view.code)}</b> · Invite</button>
-    <span class="dot ${dot}"></span>
-  </header>${net.msg ? `<div class="netmsg">${esc(net.msg)}</div>` : ''}`;
+    <button class="brand" data-act="logo" aria-label="Crossword Slots: back to the start">Crossword <span>Slots</span></button>
+    ${view ? `<button class="chip" data-act="sheet" data-a="invite"><b>${esc(view.code)}</b> · Invite</button>` : ''}
+    <button class="ic" data-act="sheet" data-a="help" aria-label="How to play">?</button>
+    <button class="ic" data-act="sheet" data-a="settings" aria-label="Settings">⚙</button>
+    ${view ? `<span class="dot ${dot}"></span>` : ''}
+  </header>${view && net.msg ? `<div class="netmsg">${esc(net.msg)}</div>` : ''}`;
 }
 
 const HERO = `<div class="hero"><div class="suits">♠<i>♥</i>♣<i>♦</i></div><h1>Crossword <span>Slots</span></h1>
@@ -519,7 +664,7 @@ function renderHome() {
       <button class="btn ghost" data-act="home">Cancel</button></div>`;
   }
   const saved = ls.json('xw_host');
-  const resumable = saved && saved.v === 2 && saved.phase !== 'ended' && saved.hostDid === did;
+  const resumable = saved && saved.v === S.SESSION_VERSION && saved.phase !== 'ended' && saved.hostDid === did;
   const names = histExtra().roster.slice(0, 8);
   return `${HERO}
     ${resumable ? `<div class="panel"><button class="btn" data-act="resume">Resume your room ${esc(saved.code)}</button></div>` : ''}
@@ -551,8 +696,81 @@ function renderPicker() {
     <button class="btn ghost" data-act="home">Leave room</button>`;
 }
 
-function seg(key, cur, options, disabled) {
-  return `<div class="seg">${options.map(([val, label, sub]) => `<button data-act="rule" data-a="${key}" data-b="${val}" class="${String(cur) === String(val) ? 'on' : ''}" ${disabled ? 'disabled' : ''}>${label}${sub ? `<small>${sub}</small>` : ''}</button>`).join('')}</div>`;
+// ---------- sheets: invite, how to play, settings ----------
+
+function renderSheet() {
+  if (!ui.sheet) return '';
+  let title;
+  let body;
+  if (ui.sheet === 'invite' && view) {
+    title = 'Invite friends';
+    const qr = qrSvg(joinUrl());
+    body = `<div class="center">
+      ${qr ? `<div class="qrbox">${qr}</div><p class="muted small">Point a phone camera at this to join.</p>` : ''}
+      <div class="bigcode">${esc(view.code)}</div>
+      <p class="muted small" style="word-break:break-all">${esc(joinUrl())}</p></div>
+      <div class="row"><button class="btn grow" data-act="share">Share link</button><button class="btn ghost grow" data-act="copyLink">Copy link</button></div>`;
+  } else if (ui.sheet === 'settings') {
+    title = 'This phone';
+    body = `<div class="opt"><div class="lab"><span>Look</span><span class="muted small">trying out five; one will be kept</span></div>
+        <div class="seg wrap">${THEMES.map(([id, name]) => `<button data-act="theme" data-a="${id}" class="${prefs.theme === id ? 'on' : ''}">${name}</button>`).join('')}</div></div>
+      <div class="opt"><div class="lab"><span>Four-colour deck</span><span class="mini">${['As', 'Ah', 'Ad', 'Ac'].map((c) => cardHtml(c)).join('')}</span></div>
+        <div class="seg">${[[0, 'Off'], [1, 'On']].map(([v, l]) => `<button data-act="pref" data-a="deck4" data-b="${v}" class="${Number(prefs.deck4) === v ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+      <div class="opt"><div class="lab"><span>Sound and vibration</span></div>
+        <div class="seg">${[[0, 'Off'], [1, 'On']].map(([v, l]) => `<button data-act="pref" data-a="sound" data-b="${v}" class="${Number(prefs.sound) === v ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+      <p class="muted small" style="margin:0">These only change this phone. Vibration works on Android; iPhones don't allow it in a browser.</p>`;
+  } else {
+    title = 'How to play';
+    body = renderHelp();
+  }
+  return `<div class="sheet-bg" data-act="closeSheet"><div class="sheet" data-act="noop">
+    <div class="sheet-h"><h2>${title}</h2><button class="x" data-act="closeSheet" aria-label="Close">✕</button></div>${body}</div></div>`;
+}
+
+// Explains the rules that are switched on right now, and what the switched-off ones would do.
+function renderHelp() {
+  const inRound = view && view.game && view.phase === 'play';
+  const r = view ? (inRound ? view.game.rules : view.rules) : null;
+  const item = (title, state, text, on = true) => `<div class="hi ${on ? '' : 'offi'}"><div class="hih"><b>${title}</b><span class="tag ${on ? 'gold' : ''}">${state}</span></div><p>${text}</p></div>`;
+  const basics = `<p style="margin:0 0 10px">Everyone puts in the same stake. Boards of five cards are dealt face up in three steps: the flop (3 cards), the turn (1) and the river (1). The best five-card poker hand on each board wins that board's pot. There is no betting and no folding.</p>
+    <p class="muted small" style="margin:0 0 12px">Hands, best to worst: straight flush, four of a kind, full house, flush, straight, three of a kind, two pair, pair, high card. Ties split the pot. Balances start at $0 and show how far up or down you are.</p>`;
+  const variants = {
+    holdem: "Two cards each. On every board you make your best five from your 2 cards and the board's 5, in any mix. You can even play the board alone.",
+    omaha: 'Four cards each. On every board you must play exactly 2 of your cards with exactly 3 from the board.',
+    pine: 'Five cards each, then everyone throws one away and plays the other four like Omaha: exactly 2 of yours with exactly 3 from the board.',
+    any: 'Five cards each and you keep them all. On every board you play 0, 1 or 2 of your cards with 5, 4 or 3 from the board.',
+  };
+  if (!r) {
+    return `${basics}${item("Hold'em", '2 cards', variants.holdem)}${item('Omaha', '4 cards', variants.omaha)}${item('Pineapple', '5 cards', variants.pine)}${item('Any', '5 cards', variants.any)}
+      ${item('Slots', 'layout', 'Each row is its own board, up to 5 boards.')}${item('Crossword', 'layout', 'A 5 by 5 grid. Every row is a board and every column is a board: 10 boards, and each card counts for one of each. Costs double the stake.')}
+      ${item('Carryover', 'option', 'An extra hand called the Pocket is dealt. If it wins a board, that pot carries to the same board next round.')}`;
+  }
+  const key = r.hole === 2 ? 'holdem' : r.hole === 4 ? 'omaha' : r.free ? 'any' : 'pine';
+  const per = r.stakeCents * (r.layout === 'crossword' ? 2 : 1);
+  const dealer = view.dealerRotate ? nameOfPlayer(view.control) : null;
+  return `<p class="muted small" style="margin:0 0 10px">${inRound ? 'The rules of this round.' : 'The rules set for the next round.'}</p>${basics}
+    ${item('Hole cards', variantName(r), variants[key])}
+    ${key === 'pine' ? item('Discard', r.discardTiming === 'pre' ? 'Before the flop' : 'After the flop', r.discardTiming === 'pre' ? 'You throw one card away before any board cards are shown.' : 'You see every flop first, then throw one card away.') : ''}
+    ${r.layout === 'crossword'
+    ? item('Board layout', 'Crossword', 'A 5 by 5 grid. Every row is a board (1 to 5 Across) and every column is a board (1 to 5 Down): 10 boards. Each card counts for one row and one column.')
+    : item('Board layout', `Slots × ${inRound ? view.game.rows : r.boards}`, 'Each row is its own board. Boards have nothing to do with each other. Switching to Crossword would also make every column a board.')}
+    ${item('Stake', `${money(per)} each`, `Base stake ${money(r.stakeCents)}${r.layout === 'crossword' ? ', doubled for Crossword' : ''}. Everything goes in the middle and is split evenly across the boards. Odd cents go to the lowest-numbered boards.`)}
+    ${r.carryover
+    ? item('Carryover', 'On', "An extra hand called the Pocket is dealt from the cards left in the deck (up to 5). Nobody plays it. If the Pocket has the best hand on a board, nobody gets that pot: it carries over to the same board next round, on top of the new pot. If it ties, only its share carries. Rules stay locked until carried money has been won.")
+    : item('Carryover', 'Off', 'No Pocket hand. Every board is won by a player every round. If it were on, an extra hand nobody plays could win boards and carry those pots into the next round.', false)}
+    ${view.oddsOn
+    ? item('Win %', 'On', "The number under each board is your chance of winning it right now, worked out from everyone's real cards. Tap a board's number for everyone's chances, your best hand, and the cards you need.")
+    : item('Win %', 'Off', "Percentages are hidden this game. Tapping a board's number still shows your best hand and the cards you need. If it were on, you would see everyone's chance on every board.", false)}
+    ${view.dealerRotate
+    ? item('Who deals', 'Passes around', `The deal moves to the next person after every round. The dealer picks Play again or New rules and taps to reveal. Right now it is ${esc(dealer)}'s deal.`)
+    : item('Who deals', 'Host', 'The host deals every round and picks the rules. If "passes around" were on, each player would take a turn dealing and choosing the game.', false)}
+    ${item('Revealing', view.stepReveal ? 'One by one' : 'All at once', 'Nothing moves on a timer. The dealer taps to reveal: "All at once" shows a whole step on every board, "One by one" shows one board per tap. At the showdown each board is paid on its own tap.')}`;
+}
+
+// ---------- lobby ----------
+
+function seg(key, cur, options, disabled, act = 'rule') {
+  return `<div class="seg">${options.map(([val, label, sub]) => `<button data-act="${act}" data-a="${key}" data-b="${val}" class="${String(cur) === String(val) ? 'on' : ''}" ${disabled ? 'disabled' : ''}>${label}${sub ? `<small>${sub}</small>` : ''}</button>`).join('')}</div>`;
 }
 
 function renderPlan() {
@@ -570,7 +788,7 @@ function renderPlan() {
 
 function renderPlayers(host, manage) {
   return `<ul class="plist">${view.players.map((p) => `<li class="${p.active && p.online ? '' : 'off'}">
-      <span class="nm">${esc(p.name)}${p.id === view.you ? '<span class="tag gold">You</span>' : ''}${p.id === view.hostId ? '<span class="tag">Host</span>' : ''}${p.bot ? '<span class="tag">CPU</span>' : ''}${!p.active ? '<span class="tag">Left</span>' : !p.online ? '<span class="tag">Offline</span>' : ''}${p.active && p.sitOut ? '<span class="tag">Sitting out</span>' : p.active && view.game && view.phase === 'play' && !p.inGame ? '<span class="tag">Next game</span>' : ''}${p.waiting ? '<span class="tag gold">Discarding</span>' : ''}</span>
+      <span class="nm">${esc(p.name)}${p.id === view.you ? '<span class="tag gold">You</span>' : ''}${p.id === view.hostId ? '<span class="tag">Host</span>' : ''}${view.dealerRotate && p.id === view.control ? '<span class="tag gold">Dealer</span>' : ''}${p.bot ? '<span class="tag">CPU</span>' : ''}${!p.active ? '<span class="tag">Left</span>' : !p.online ? '<span class="tag">Offline</span>' : ''}${p.active && p.sitOut ? '<span class="tag">Sitting out</span>' : p.active && view.game && view.phase === 'play' && !p.inGame ? '<span class="tag">Next round</span>' : ''}${p.waiting ? '<span class="tag gold">Discarding</span>' : ''}</span>
       ${balHtml(p.balance)}
       ${host && manage && p.active && !p.bot && p.online && p.id !== view.hostId ? `<button class="x wide" data-act="makeHost" data-a="${esc(p.id)}">Make host</button>` : ''}
       ${host && manage && p.active && p.id !== view.hostId ? `<button class="x" data-act="kick" data-a="${esc(p.id)}" aria-label="Remove">✕</button>` : ''}
@@ -584,21 +802,22 @@ function renderSelf(host) {
 
 function renderHistory() {
   const d = (t) => new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-  const chips = (list) => list.map((n) => `<span class="hc ${n.cents > 0 ? 'pos' : n.cents < 0 ? 'neg' : ''}">${esc(n.name)} ${n.cents > 0 ? '+' : ''}${money(n.cents)}</span>`).join('');
+  const chips = (list, luck) => list.map((n) => `<span class="hc ${n.cents > 0 ? 'pos' : n.cents < 0 ? 'neg' : ''}">${esc(n.name)} ${signed(n.cents)}${luck && n.luck ? ` <span class="muted">(luck ${signed(n.luck)})</span>` : ''}</span>`).join('');
   if (!view.log.length && !view.past.length) return '';
   return `<details class="panel hist"><summary>History</summary>
-    ${view.log.length ? `<h3>This session</h3>${view.log.slice().reverse().map((l) => `<div class="hrow"><div class="muted small">Game ${l.no} · ${esc(l.line)}${l.carried ? ` · <span class="co">${money(l.carried)} carried</span>` : ''}</div><div>${chips(l.net)}</div></div>`).join('')}` : ''}
-    ${view.totals.length ? `<h3>All-time on the host's phone</h3><div class="hrow">${chips(view.totals)}</div>` : ''}
-    ${view.past.length ? `<h3>Past sessions</h3>${view.past.map((h) => `<div class="hrow"><div class="muted small">${d(h.when)} · ${h.games} game${h.games === 1 ? '' : 's'}</div><div>${chips(h.players)}</div></div>`).join('')}` : ''}
+    ${view.log.length ? `<h3>This game</h3>${view.log.slice().reverse().map((l) => `<div class="hrow"><div class="muted small">Round ${l.no} · ${esc(l.line)}${l.carried ? ` · <span class="co">${money(l.carried)} carried</span>` : ''}</div><div>${chips(l.net)}</div></div>`).join('')}` : ''}
+    ${view.totals.length ? `<h3>All-time on the host's phone</h3><div class="hrow">${chips(view.totals, true)}</div><p class="muted small" style="margin:4px 0 0">Luck is what someone won compared with what their starting cards were worth. Only rounds between people count.</p>` : ''}
+    ${view.past.length ? `<h3>Past games</h3>${view.past.map((h) => `<div class="hrow"><div class="muted small">${d(h.when)} · ${h.games} round${h.games === 1 ? '' : 's'}</div><div>${chips(h.players, true)}</div></div>`).join('')}` : ''}
   </details>`;
 }
 
-function renderLobby(host) {
+function renderLobby(host, ctrl) {
   const r = view.rules;
   const lock = view.locked;
-  const dis = !host || lock;
+  const dis = !ctrl || lock;
   const nIn = view.players.filter((p) => p.active && !p.sitOut).length;
-  const rules = host
+  const roundNo = (view.log.length ? view.log[view.log.length - 1].no : 0) + 1;
+  const rules = ctrl
     ? `${lock ? '<div class="lock">🔒 Rules are locked until the carryover pot has been played out.</div>' : ''}
       <div class="opt"><div class="lab"><span>Hole cards</span></div>${seg('variant', r.hole === 5 && r.free ? '5f' : r.hole, [[2, '2', "Hold'em"], [4, '4', 'Omaha'], [5, '5', 'Pineapple'], ['5f', '5', 'Any (keep all)']], dis)}</div>
       ${r.hole === 5 && !r.free ? `<div class="opt"><div class="lab"><span>Discard one card</span></div>${seg('discardTiming', r.discardTiming, [['pre', 'Before the flop'], ['post', 'After the flop']], dis)}</div>` : ''}
@@ -607,25 +826,29 @@ function renderLobby(host) {
       ${r.layout === 'slots' ? `<div class="opt"><div class="lab"><span>Boards</span></div>${seg('boards', r.boards, [[1, '1'], [2, '2'], [3, '3'], [4, '4'], [5, '5']], dis)}</div>` : ''}
       <div class="opt"><div class="lab"><span>Carryover (the Pocket)</span></div>${seg('carryover', r.carryover ? 1 : 0, [[0, 'Off'], [1, 'On']], dis)}</div>
       <div class="opt"><div class="lab"><span>Show win %</span>${!r.showOdds && view.oddsOn ? '<span class="muted small">always on vs CPUs</span>' : ''}</div>${seg('showOdds', r.showOdds ? 1 : 0, [[0, 'Off'], [1, 'On']], false)}</div>
+      ${host ? `<div class="opt"><div class="lab"><span>Who deals</span></div>${seg('dealerRotate', view.dealerRotate ? 1 : 0, [[0, 'Host', 'every round'], [1, 'Passes around', 'dealer picks the rules']], false, 'option')}</div>` : ''}
       <div class="opt row"><div class="grow">Base stake per player</div><div class="stake">$<input class="text" id="stake" type="number" inputmode="decimal" min="0.01" step="0.01" value="${(r.stakeCents / 100).toFixed(2)}" ${dis ? 'disabled' : ''}></div></div>`
     : `<p style="margin:0 0 8px"><b>${esc(rulesLine(r))}</b><br><span class="muted">Base stake ${money(r.stakeCents)} per player · win % ${view.oddsOn ? 'on' : 'off'}</span></p>`;
+  const bar = [];
+  if (ctrl) bar.push(`<button class="btn" data-act="deal" ${view.plan.ok ? '' : 'disabled'}>Deal round ${roundNo}</button>`);
+  if (host) bar.push('<button class="btn danger sm" style="width:100%" data-act="end">End game and settle up</button>');
   return `<div class="cols"><div class="col-l">
     <div class="panel"><h2>Players (${nIn} in)</h2>${renderPlayers(host, true)}
       ${renderSelf(host)}
-      ${host ? '<div class="row mt"><button class="btn ghost sm grow" data-act="addBot">+ Add CPU player</button><button class="btn ghost sm grow" data-act="share">Invite friends</button></div>' : ''}
+      ${host ? '<div class="row mt"><button class="btn ghost sm grow" data-act="addBot">+ Add CPU player</button><button class="btn ghost sm grow" data-act="sheet" data-a="invite">Invite friends</button></div>' : ''}
     </div>
-    ${host ? `<div class="bar"><div class="in">
-      <button class="btn" data-act="deal" ${view.plan.ok ? '' : 'disabled'}>Deal${view.game ? ' next game' : ''}</button>
-      <button class="btn danger sm" style="width:100%" data-act="end">End session and settle up</button>
-    </div></div>` : ''}
+    ${bar.length ? `<div class="bar"><div class="in">${bar.join('')}</div></div>` : ''}
     </div><div class="col-r">
-    <div class="panel"><h2>Rules for the next game</h2>${rules}${renderPlan()}
+    <div class="panel"><h2>Rules for the next round <button class="link" data-act="sheet" data-a="help">What do these mean?</button></h2>${rules}${renderPlan()}
       <p class="muted small" style="margin:8px 0 0">Rounding: everything is counted in cents. If a pot doesn't split evenly, the extra cents go to the lowest-numbered boards, and on a tied board to the tied players in seat order (the Pocket last).</p>
     </div>
     ${renderHistory()}
-    ${host ? '' : '<p class="status">Waiting for the host to deal…</p><button class="btn ghost" data-act="leave">Leave room</button>'}
+    ${ctrl ? '' : `<p class="status">Waiting for ${esc(nameOfPlayer(view.control))} to deal…</p>`}
+    ${host ? '' : '<button class="btn ghost" data-act="leave">Leave room</button>'}
     </div></div>`;
 }
+
+// ---------- the table ----------
 
 function boardCells(g, i) {
   const cw = g.rules.layout === 'crossword';
@@ -676,7 +899,7 @@ function renderGrid(g) {
 function winnersText(res) {
   const real = res.winners.filter((w) => w.id !== CARRY_ID);
   const carry = res.winners.find((w) => w.id === CARRY_ID);
-  if (carry && !real.length) return `The Pocket wins. <span class="co">${money(carry.cents)} carries to ${esc(res.label)} next game.</span>`;
+  if (carry && !real.length) return `The Pocket wins. <span class="co">${money(carry.cents)} carries to ${esc(res.label)} next round.</span>`;
   const names = real.map((w) => `${esc(w.name)} ${real.length > 1 || carry ? money(w.cents) : ''}`.trim()).join(', ');
   if (carry) return `Split: ${names}. <span class="co">The Pocket's ${money(carry.cents)} carries over.</span>`;
   return real.length > 1 ? `Split: ${names}` : `${names} wins ${money(real[0].cents)}`;
@@ -699,7 +922,7 @@ const holeOf = (g, id) => ((g.hands || []).find((h) => h.id === id) || { cards: 
 let outCache = { key: '', val: null };
 function myOutlook(g, i) {
   if (!g.myHole) return null;
-  const key = [view.code, g.no, i, g.stage, g.myDiscard].join('|');
+  const key = [view.code, g.no, i, g.shown, g.myDiscard].join('|');
   if (outCache.key === key) return outCache.val;
   const board = boardCardsOf(g, i);
   let val = { empty: true };
@@ -717,8 +940,8 @@ function myOutlook(g, i) {
 function renderOutlook(g, i) {
   const o = myOutlook(g, i);
   if (!o) return '';
-  if (o.empty) return '<p class="muted" style="margin:0 0 8px">No cards on this board yet.</p>';
-  const flip = o.toCome === 2 ? 'on the turn' : 'on the river';
+  if (o.empty) return '<p class="muted" style="margin:0 0 8px">Fewer than three cards on this board so far.</p>';
+  const flip = o.toCome === 2 ? 'on the next card' : 'on the last card';
   // most likely first
   const rows = o.rows.slice().sort((p, q) => (q.final ?? q.next) - (p.final ?? p.next)).map((r) => {
     const bits = [];
@@ -763,7 +986,7 @@ function renderEV(g) {
 }
 
 function renderMyHand(g) {
-  if (!g.myHole) return `<p class="status">${view.sitOut ? "You're sitting out and watching." : "You'll be dealt in next game."}</p>`;
+  if (!g.myHole) return `<p class="status">${view.sitOut ? "You're sitting out and watching." : "You'll be dealt in next round."}</p>`;
   if (g.stage === 'showdown' || g.stage === 'done') return '';
   const cards = g.myHole.map((c, i) => {
     if (g.needDiscard) return cardHtml(c, `tap ${ui.sel === i ? 'sel' : ''}`, `data-act="pick" data-a="${i}"`);
@@ -778,11 +1001,12 @@ function renderMyHand(g) {
   return `<div class="handlab">Your cards${how}</div><div class="hand n${g.myHole.length}">${cards}</div>${extra}`;
 }
 
-function renderTable(host) {
+function renderTable(host, ctrl) {
   const g = view.game;
   const grid = renderGrid(g);
   const paying = g.stage === 'showdown' ? g.results[g.results.length - 1] : null;
   const waiting = g.waitingOn.length;
+  const runner = esc(nameOfPlayer(view.control));
   let mid = '';
   if (paying) {
     mid = `<div class="banner"><div class="t">${esc(paying.label)} · ${money(paying.pot)} pot</div>
@@ -790,11 +1014,12 @@ function renderTable(host) {
       <div class="h">${esc(paying.handName)}</div>
       ${paying.winners.map((w) => `<div class="bw">${paying.winners.length > 1 ? `<span class="muted small">${esc(w.name)}</span>` : ''}${usedHtml(holeOf(g, w.id), boardCardsOf(g, paying.index), w.cards)}</div>`).join('')}</div>`;
   } else if (g.stage !== 'done') {
-    const next = { pre: 'the flop', flop: 'the turn', turn: 'the river', river: 'the showdown' }[g.stage];
-    const line = waiting ? `Waiting for ${esc(g.waitingOn.join(', '))} to discard…` : host ? '' : `Waiting for the host to reveal ${next}…`;
+    const line = waiting ? `Waiting for ${esc(g.waitingOn.join(', '))} to discard…` : ctrl ? '' : `Waiting for ${runner} to ${g.next ? `reveal the ${g.next.street}` : 'start the showdown'}…`;
     if (line) mid = `<p class="status">${line}</p>`;
+  } else if (!ctrl) {
+    mid = `<p class="status">Waiting for ${runner} to deal the next round…</p>`;
   }
-  const hint = ui.board === null && g.stage !== 'pre' && (g.odds || g.results || g.myHole)
+  const hint = ui.board === null && g.shown > 0 && (g.odds || g.results || g.myHole)
     ? `<p class="hint">Tap a board's number to see ${g.results ? 'every hand on it' : g.odds ? "your hand, what you're looking for, and everyone's chances" : "your hand and what you're looking for"}.</p>` : '';
   let lower = '';
   if (g.hands) {
@@ -804,26 +1029,36 @@ function renderTable(host) {
   }
   if (g.stage === 'done') {
     const carried = view.carry.reduce((a, b) => a + b, 0);
-    lower = `<div class="panel"><h2>Game ${g.no} results</h2><table class="sum">${g.results.map((r) => `<tr data-act="board" data-a="${r.index}"><td><b>${esc(r.label)}</b></td>
-        <td>${r.winners.map((w) => (w.id === CARRY_ID ? '<span class="co">The Pocket</span>' : esc(w.name))).join(', ')}<br><span class="muted small">${esc(r.handName)}</span></td>
-        <td>${money(r.pot)}</td></tr>`).join('')}</table></div>
-      <div class="panel"><h2>This game</h2><ul class="plist">${g.net.map((n) => `<li><span class="nm">${esc(n.name)}</span>${balHtml(n.cents)}</li>`).join('')}</ul>
-      ${carried ? `<p class="co small" style="margin:8px 0 0">${money(carried)} carries over to the next game. Rules stay locked until it is won.</p>` : ''}</div>` + lower;
+    const anyPre = g.results.some((r) => r.winners.some((w) => w.pre !== null));
+    lower = `<div class="panel"><h2>Round ${g.no} results</h2><table class="sum">${g.results.map((r) => `<tr data-act="board" data-a="${r.index}"><td><b>${esc(r.label)}</b></td>
+        <td>${r.winners.map((w) => `${w.id === CARRY_ID ? '<span class="co">The Pocket</span>' : esc(w.name)}${w.pre !== null ? ` <span class="pre">${pct(w.pre)}</span>` : ''}`).join(', ')}<br><span class="muted small">${esc(r.handName)}</span></td>
+        <td>${money(r.pot)}</td></tr>`).join('')}</table>
+        ${anyPre ? '<p class="muted small" style="margin:8px 0 0">The % is the chance that hand had on a board before any board card was dealt.</p>' : ''}</div>
+      <div class="panel"><h2>This round</h2><ul class="plist">${g.net.map((n) => `<li><span class="nm">${esc(n.name)}${n.pre !== null ? ` <span class="pre">${pct(n.pre)} a board</span>` : ''}<br><span class="muted small">luck ${signed(n.luck)}</span></span>${balHtml(n.cents)}</li>`).join('')}</ul>
+      <p class="muted small" style="margin:8px 0 0">Luck is what you won compared with what your starting cards were worth on average.</p>
+      ${carried ? `<p class="co small" style="margin:8px 0 0">${money(carried)} carries over to the next round. Rules stay locked until it is won.</p>` : ''}</div>` + lower;
   }
   let bar = '';
-  if (host) {
+  if (ctrl) {
     if (g.stage === 'done') {
-      bar = `${view.plan.ok ? '<button class="btn" data-act="deal">Deal again, same rules</button>' : `<div class="plan no"><p>${esc(view.plan.reason)}</p></div>`}
-        <div class="two"><button class="btn ghost sm" data-act="lobby">${view.locked ? 'Players and rules' : 'Change rules'}</button><button class="btn danger sm" data-act="end">End session</button></div>`;
+      bar = `${view.plan.ok ? '<button class="btn" data-act="deal">Play again, same rules</button>' : `<div class="plan no"><p>${esc(view.plan.reason)}</p></div>`}
+        <div class="two"><button class="btn ghost sm" data-act="lobby">${view.locked ? 'Players and rules' : 'New rules'}</button>${host ? '<button class="btn danger sm" data-act="end">End game</button>' : ''}</div>`;
     } else if (waiting) {
       bar = `<button class="btn ghost" data-act="autoDiscard">Auto-discard for ${waiting} slow player${waiting === 1 ? '' : 's'}</button>`;
+    } else if (g.stage === 'showdown') {
+      bar = `<button class="btn" data-act="next">${g.payIndex < g.nBoards ? `Pay ${esc(g.labels[g.payIndex])} ▸` : 'Finish the round'}</button>`;
     } else {
-      const label = { pre: 'Reveal the flop', flop: 'Reveal the turn', turn: 'Reveal the river', river: 'Showdown', showdown: `Next ▸ (${g.payIndex} of ${g.nBoards} paid)` }[g.stage];
-      bar = `<button class="btn" data-act="next">${label}</button>`;
+      const street = g.next ? g.next.street : null;
+      const cap = street ? street[0].toUpperCase() + street.slice(1) : '';
+      const label = !street ? 'Showdown'
+        : view.stepReveal ? `${cap} · ${esc(g.labels[g.next.board])}`
+          : `${g.next.started ? 'Finish' : 'Reveal'} the ${street}`;
+      bar = `<div class="two"><button class="btn" data-act="next" style="flex:1">${label}</button>
+        ${street ? `<button class="btn ghost sm tog" data-act="step" data-a="${view.stepReveal ? 0 : 1}" aria-label="Switch between revealing every board at once and one board per tap">${view.stepReveal ? 'One by one' : 'All at once'}<small>tap to switch</small></button>` : ''}</div>`;
     }
   }
   return `<div class="cols"><div class="col-l">
-    <div class="info">Game ${g.no} · <b>${esc(rulesLine(g.rules, g.rows))}</b> · ${money(g.perPlayer)} in each</div>
+    <div class="info">Round ${g.no} · <b>${esc(rulesLine(g.rules, g.rows))}</b> · ${money(g.perPlayer)} in each <button class="link" data-act="sheet" data-a="help">Rules</button></div>
     ${grid}
     ${hint}
     ${bar ? `<div class="bar"><div class="in">${bar}</div></div>` : ''}
@@ -840,25 +1075,27 @@ function renderTable(host) {
 function renderEnded(host) {
   const sorted = view.players.slice().sort((a, b) => b.balance - a.balance);
   return `
-    <div class="hero" style="padding-top:8px"><h1>Settle <span>up</span></h1><p>The session is over. Chips are play money: settle between yourselves.</p></div>
+    <div class="hero" style="padding-top:8px"><h1>Settle <span>up</span></h1><p>The game is over. Chips are play money: settle between yourselves.</p></div>
     <div class="panel"><h2>Who pays who</h2>
       ${view.settle && view.settle.length
     ? `<ul class="plist settle">${view.settle.map((t) => `<li><span class="nm"><b>${esc(t.from)}</b><span class="arrow">pays</span><b>${esc(t.to)}</b></span><span class="bal">${money(t.cents)}</span></li>`).join('')}</ul>`
     : '<p class="muted" style="margin:0">Everyone is even. Nobody owes anything.</p>'}
     </div>
     <div class="panel"><h2>Final balances</h2><ul class="plist">${sorted.map((p) => `<li><span class="nm">${esc(p.name)}${p.id === view.you ? '<span class="tag gold">You</span>' : ''}</span>${balHtml(p.balance)}</li>`).join('')}</ul>
-      ${view.refund ? `<p class="co small" style="margin:8px 0 0">${money(view.refund.total)} of unclaimed carryover was split evenly between the ${view.refund.count} players of the last game.</p>` : ''}
+      ${view.refund ? `<p class="co small" style="margin:8px 0 0">${money(view.refund.total)} of unclaimed carryover was split evenly between the ${view.refund.count} players of the last round.</p>` : ''}
     </div>
+    ${view.awards && view.awards.length ? `<div class="panel"><h2>Awards</h2><ul class="plist">${view.awards.map((a) => `<li><span class="nm"><span class="muted small">${esc(a.title.toUpperCase())}</span><br><b>${esc(a.name)}</b> <span class="muted small">· ${esc(a.detail)}</span></span></li>`).join('')}</ul></div>` : ''}
     ${renderHistory()}
-    <button class="btn ${host ? '' : 'ghost'}" data-act="${host ? 'fresh' : 'home'}">${host ? 'Start a new session' : 'Back to start'}</button>`;
+    <button class="btn ${host ? '' : 'ghost'}" data-act="${host ? 'fresh' : 'home'}">${host ? 'Start a new game' : 'Back to start'}</button>`;
 }
 
 // ---------- boot ----------
 
 (function boot() {
   const saved = ls.json('xw_host');
-  if (saved && saved.v !== 2) ls.del('xw_host'); // from an older version of the game
-  if (urlRoom && saved && saved.v === 2 && saved.hostDid === did && saved.code === urlRoom) {
+  const mine = saved && saved.v === S.SESSION_VERSION && saved.hostDid === did;
+  if (saved && saved.v !== S.SESSION_VERSION) ls.del('xw_host'); // from an older version of the game
+  if (urlRoom && mine && saved.code === urlRoom) {
     session = saved;
     startHost(false);
   } else if (urlRoom) {

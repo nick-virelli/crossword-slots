@@ -259,7 +259,7 @@ export function planGame(rules, nPlayers, carry = []) {
     rows = Math.min(rules.boards, fit, 5);
     nBoards = rows;
     if (rows < rules.boards) {
-      notes.push(`The deck is short with ${nPlayers} players, so this game plays ${rows} board${rows === 1 ? '' : 's'} instead of ${rules.boards}.`);
+      notes.push(`The deck is short with ${nPlayers} players, so this round plays ${rows} board${rows === 1 ? '' : 's'} instead of ${rules.boards}.`);
     }
     for (let i = nBoards; i < 10; i++) {
       if (carry[i] > 0) {
@@ -268,10 +268,10 @@ export function planGame(rules, nPlayers, carry = []) {
     }
   }
   const pocket = co ? Math.min(POCKET_MAX, 52 - rows * 5 - holeCards) : 0;
-  if (co && pocket < POCKET_MAX) notes.push(`The Pocket gets ${pocket} cards this game: that is all the deck has left.`);
+  if (co && pocket < POCKET_MAX) notes.push(`The Pocket gets ${pocket} cards this round: that is all the deck has left.`);
   const cards = rows * 5 + holeCards + pocket;
   const burn = cards + 1 <= 52;
-  if (!burn) notes.push('No burn card this game: the deck has no room for it.');
+  if (!burn) notes.push('No burn card this round: the deck has no room for it.');
   const perPlayer = rules.stakeCents * (rules.layout === 'crossword' ? 2 : 1);
   const total = perPlayer * nPlayers;
   const base = splitEven(total, nBoards);
