@@ -203,3 +203,29 @@ details.hist summary { cursor: pointer; font-size: 12px; text-transform: upperca
 .lk { padding: 7px 0 2px; border-top: 1px dashed var(--line); margin-top: 6px; }
 .lk b { color: var(--gold); }
 .lkc { margin-top: 5px; }
+
+/* whole hand + whole board, unused cards dimmed */
+.mini.sm .card { --cw: 27px; }
+.mini.sm .card .r { font-size: 13px; }
+.mini.sm .card .s { font-size: 11px; }
+.mini .card.un { opacity: 0.3; }
+.mini .sep { display: inline-block; width: 9px; }
+.plist li.col { flex-direction: column; align-items: flex-start; gap: 5px; }
+.banner .bw { margin-top: 6px; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+
+/* ---- desktop: board on the left, everything else on the right ---- */
+@media (min-width: 900px) {
+  :root { --cw: clamp(46px, calc((100vh - 240px) / 6.9), 88px); }
+  #app { max-width: 1120px; padding: 14px 24px 24px; }
+  .narrow { max-width: 480px; margin: 0 auto; }
+  .cols { display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr); gap: 28px; align-items: start; }
+  .col-l { position: sticky; top: 12px; }
+  .col-r { display: flex; flex-direction: column; }
+  .col-r .myhand { order: -1; }
+  .col-r > .banner, .col-r > .status { order: -2; }
+  .bar { position: static; padding: 0; background: none; margin-top: 4px; }
+  .bar .in { max-width: none; }
+  .hand .card, .hand.n5 .card { --cw: 68px; }
+  .grid { margin-bottom: 8px; }
+  .hint { margin-top: 0; }
+}

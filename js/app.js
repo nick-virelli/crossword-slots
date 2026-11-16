@@ -2,9 +2,9 @@
 // The host's phone runs the game (session.js) and sends every other phone only what
 // that player is allowed to see. Phones talk directly to each other through PeerJS.
 
-import * as S from './session.js?v=1794812783';
-import { cryptoRnd, money, variantName, CARRY_ID, makeDeck, playMode } from './engine.js?v=1794812783';
-import { outlook } from './odds.js?v=1794812783';
+import * as S from './session.js?v=1794813247';
+import { cryptoRnd, money, variantName, CARRY_ID, makeDeck, playMode } from './engine.js?v=1794813247';
+import { outlook } from './odds.js?v=1794813247';
 
 const PEER_PREFIX = 'xwslots-v1-';
 const PAY_MS = 3200;
@@ -490,11 +490,11 @@ $app.addEventListener('keydown', (e) => {
 // ---------- rendering ----------
 
 function render() {
-  if (!view) { $app.innerHTML = renderHome(); return; }
+  if (!view) { $app.innerHTML = `<div class="narrow">${renderHome()}</div>`; return; }
   const host = view.hostId === view.you;
   let body;
-  if (view.phase === 'ended') body = renderEnded(host);
-  else if (!view.you) body = renderPicker();
+  if (view.phase === 'ended') body = `<div class="narrow">${renderEnded(host)}</div>`;
+  else if (!view.you) body = `<div class="narrow">${renderPicker()}</div>`;
   else if (view.phase === 'lobby' || !view.game) body = renderLobby(host);
   else body = renderTable(host);
   $app.innerHTML = renderHeader() + body;
@@ -609,20 +609,22 @@ function renderLobby(host) {
       <div class="opt"><div class="lab"><span>Show win %</span>${!r.showOdds && view.oddsOn ? '<span class="muted small">always on vs CPUs</span>' : ''}</div>${seg('showOdds', r.showOdds ? 1 : 0, [[0, 'Off'], [1, 'On']], false)}</div>
       <div class="opt row"><div class="grow">Base stake per player</div><div class="stake">$<input class="text" id="stake" type="number" inputmode="decimal" min="0.01" step="0.01" value="${(r.stakeCents / 100).toFixed(2)}" ${dis ? 'disabled' : ''}></div></div>`
     : `<p style="margin:0 0 8px"><b>${esc(rulesLine(r))}</b><br><span class="muted">Base stake ${money(r.stakeCents)} per player · win % ${view.oddsOn ? 'on' : 'off'}</span></p>`;
-  return `
+  return `<div class="cols"><div class="col-l">
     <div class="panel"><h2>Players (${nIn} in)</h2>${renderPlayers(host, true)}
       ${renderSelf(host)}
       ${host ? '<div class="row mt"><button class="btn ghost sm grow" data-act="addBot">+ Add CPU player</button><button class="btn ghost sm grow" data-act="share">Invite friends</button></div>' : ''}
     </div>
+    ${host ? `<div class="bar"><div class="in">
+      <button class="btn" data-act="deal" ${view.plan.ok ? '' : 'disabled'}>Deal${view.game ? ' next game' : ''}</button>
+      <button class="btn danger sm" style="width:100%" data-act="end">End session and settle up</button>
+    </div></div>` : ''}
+    </div><div class="col-r">
     <div class="panel"><h2>Rules for the next game</h2>${rules}${renderPlan()}
       <p class="muted small" style="margin:8px 0 0">Rounding: everything is counted in cents. If a pot doesn't split evenly, the extra cents go to the lowest-numbered boards, and on a tied board to the tied players in seat order (the Pocket last).</p>
     </div>
     ${renderHistory()}
     ${host ? '' : '<p class="status">Waiting for the host to deal…</p><button class="btn ghost" data-act="leave">Leave room</button>'}
-    ${host ? `<div class="bar"><div class="in">
-      <button class="btn" data-act="deal" ${view.plan.ok ? '' : 'disabled'}>Deal${view.game ? ' next game' : ''}</button>
-      <button class="btn danger sm" style="width:100%" data-act="end">End session and settle up</button>
-    </div></div>` : ''}`;
+    </div></div>`;
 }
 
 function boardCells(g, i) {
@@ -680,19 +682,33 @@ function winnersText(res) {
   return real.length > 1 ? `Split: ${names}` : `${names} wins ${money(real[0].cents)}`;
 }
 
+// A player's whole hand and the whole board, with the cards that aren't being played dimmed.
+function usedHtml(hole, board, used) {
+  const u = new Set(used);
+  const one = (c) => cardHtml(c, u.has(c) ? '' : 'un');
+  return `<span class="mini sm">${hole.map(one).join('')}<span class="sep"></span>${board.map(one).join('')}</span>`;
+}
+function boardCardsOf(g, i) {
+  const inBoard = boardCells(g, i);
+  const board = [];
+  for (let r = 0; r < g.rows; r++) for (let c = 0; c < 5; c++) if (inBoard(r, c) && g.grid[r][c]) board.push(g.grid[r][c]);
+  return board;
+}
+const holeOf = (g, id) => ((g.hands || []).find((h) => h.id === id) || { cards: [] }).cards;
+
 let outCache = { key: '', val: null };
 function myOutlook(g, i) {
   if (!g.myHole) return null;
   const key = [view.code, g.no, i, g.stage, g.myDiscard].join('|');
   if (outCache.key === key) return outCache.val;
-  const inBoard = boardCells(g, i);
-  const board = [];
-  for (let r = 0; r < g.rows; r++) for (let c = 0; c < 5; c++) if (inBoard(r, c) && g.grid[r][c]) board.push(g.grid[r][c]);
+  const board = boardCardsOf(g, i);
   let val = { empty: true };
   if (board.length >= 3) {
     const hole = g.myDiscard === null ? g.myHole : g.myHole.filter((_, k) => k !== g.myDiscard);
     const seen = new Set([...g.myHole, ...g.grid.flat().filter(Boolean)]);
     val = outlook(hole, board, makeDeck().filter((c) => !seen.has(c)), playMode(g.rules)) || { empty: true };
+    val.hole = hole;
+    val.board = board;
   }
   outCache = { key, val };
   return val;
@@ -713,7 +729,8 @@ function renderOutlook(g, i) {
     return `<div class="lk"><div class="lkh"><b>${r.label}</b><span class="muted small">${bits.join(' · ')}</span></div>
       ${shown.length ? `<div class="lkc">${mini(shown)}${r.cards.length > shown.length ? `<span class="muted small"> +${r.cards.length - shown.length} more</span>` : ''}</div>` : ''}</div>`;
   }).join('');
-  return `<div class="mine"><div class="lkh"><span><span class="muted small">YOUR HAND</span><br><b>${esc(o.name)}</b></span>${mini(o.cards)}</div>
+  return `<div class="mine"><div class="lkh"><span><span class="muted small">YOUR HAND</span><br><b>${esc(o.name)}</b></span></div>
+    <div class="lkc">${usedHtml(o.hole, o.board, o.cards)}</div>
     ${o.toCome ? (rows ? `<div class="muted small lkt">WHAT YOU'RE LOOKING FOR</div>${rows}` : '<p class="muted small" style="margin:6px 0 0">No single card turns this into a better kind of hand.</p>') : ''}</div>`;
 }
 
@@ -728,7 +745,7 @@ function renderBoardDetail(g) {
   const mine = res ? '' : renderOutlook(g, i);
   if (res) {
     const won = new Map(res.winners.map((w) => [w.id, w.cents]));
-    body = `<ul class="plist">${res.all.map((x) => `<li class="${won.has(x.id) ? 'winner' : ''}"><span class="nm">${who(x)}<br><span class="muted small">${esc(x.handName)}${won.has(x.id) ? ` · <span class="co">${x.id === CARRY_ID ? 'carries' : 'wins'} ${money(won.get(x.id))}</span>` : ''}</span></span>${mini(x.cards)}</li>`).join('')}</ul>`;
+    body = `<ul class="plist">${res.all.map((x) => `<li class="col ${won.has(x.id) ? 'winner' : ''}"><span class="nm">${who(x)} <span class="muted small">· ${esc(x.handName)}${won.has(x.id) ? ` · <span class="co">${x.id === CARRY_ID ? 'carries' : 'wins'} ${money(won.get(x.id))}</span>` : ''}</span></span>${usedHtml(holeOf(g, x.id), boardCardsOf(g, i), x.cards)}</li>`).join('')}</ul>`;
   } else if (odds) {
     body = odds.map((x) => `<div class="orow ${x.id === CARRY_ID ? 'pk' : ''}"><span class="nm">${who(x)}</span><span class="track"><i style="width:${Math.round(x.share * 100)}%"></i></span><b>${pct(x.share)}</b></div>`).join('')
       + '<p class="muted small" style="margin:8px 0 0">Chance of winning this board right now. A split counts as a share.</p>';
@@ -770,7 +787,8 @@ function renderTable(host) {
   if (paying) {
     mid = `<div class="banner"><div class="t">${esc(paying.label)} · ${money(paying.pot)} pot</div>
       <div class="w">${winnersText(paying)}</div>
-      <div class="h">${esc(paying.handName)} ${mini(paying.winners[0].cards)}</div></div>`;
+      <div class="h">${esc(paying.handName)}</div>
+      ${paying.winners.map((w) => `<div class="bw">${paying.winners.length > 1 ? `<span class="muted small">${esc(w.name)}</span>` : ''}${usedHtml(holeOf(g, w.id), boardCardsOf(g, paying.index), w.cards)}</div>`).join('')}</div>`;
   } else if (g.stage !== 'done') {
     const next = { pre: 'the flop', flop: 'the turn', turn: 'the river', river: 'the showdown' }[g.stage];
     const line = waiting ? `Waiting for ${esc(g.waitingOn.join(', '))} to discard…` : host ? '' : `Waiting for the host to reveal ${next}…`;
@@ -804,17 +822,19 @@ function renderTable(host) {
       bar = `<button class="btn" data-act="next">${label}</button>`;
     }
   }
-  return `
+  return `<div class="cols"><div class="col-l">
     <div class="info">Game ${g.no} · <b>${esc(rulesLine(g.rules, g.rows))}</b> · ${money(g.perPlayer)} in each</div>
     ${grid}
     ${hint}
-    ${renderBoardDetail(g)}
+    ${bar ? `<div class="bar"><div class="in">${bar}</div></div>` : ''}
+    </div><div class="col-r">
     ${mid}
-    ${renderMyHand(g)}
+    ${renderBoardDetail(g)}
+    <div class="myhand">${renderMyHand(g)}</div>
     ${renderEV(g)}
     ${lower}
     <div class="panel"><h2>Balances</h2>${renderPlayers(host, false)}${renderSelf(host)}</div>
-    ${bar ? `<div class="bar"><div class="in">${bar}</div></div>` : ''}`;
+    </div></div>`;
 }
 
 function renderEnded(host) {
