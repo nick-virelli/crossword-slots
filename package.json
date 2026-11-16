@@ -1,0 +1,9 @@
+{
+  "name": "crossword-slots",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/engine.test.js",
+    "start": "node serve.mjs"
+  }
+}

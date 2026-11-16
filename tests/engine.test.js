@@ -1,0 +1,361 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  evaluate5, handName, handCategory, bestHoldem, bestOmaha, makeDeck, shuffle, planGame,
+  dealGame, boardsOf, resolveBoards, splitEven, settleUp, autoDiscard, crosswordMaxPlayers,
+  CARRY_ID, DEFAULT_RULES,
+} from '../js/engine.js';
+import {
+  newSession, addPlayer, addBot, removePlayer, setRules, deal, discard, autoDiscardRest,
+  advance, toLobby, endSession, viewFor, carryLocked,
+} from '../js/session.js';
+
+const h = (s) => s.split(' ');
+const ev = (s) => evaluate5(h(s));
+
+// deterministic RNG for repeatable tests
+function seeded(seed) {
+  let a = seed >>> 0;
+  return (n) => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return Math.floor((((t ^ (t >>> 14)) >>> 0) / 4294967296) * n);
+  };
+}
+
+// ---------- hand rankings ----------
+
+test('hand categories rank in the right order', () => {
+  const ladder = [
+    'Ah Kd 9c 5s 3h', // high card
+    '2h 2d 9c 5s 3h', // pair
+    '2h 2d 3c 3s 4h', // two pair
+    '2h 2d 2c 5s 3h', // trips
+    'Ah 2d 3c 4s 5h', // wheel straight
+    '2h 7h 9h Jh Kh', // flush
+    '2h 2d 2c 3s 3h', // full house
+    '2h 2d 2c 2s 3h', // quads
+    'Ah 2h 3h 4h 5h', // straight flush (wheel)
+    'Th Jh Qh Kh Ah', // royal
+  ].map(ev);
+  for (let i = 1; i < ladder.length; i++) assert.ok(ladder[i] > ladder[i - 1], `rung ${i}`);
+  assert.deepEqual(ladder.map(handCategory), [0, 1, 2, 3, 4, 5, 6, 7, 8, 8]);
+});
+
+test('kickers and tie-breaks', () => {
+  assert.ok(ev('Ah Ad Kc 5s 3h') > ev('Ah Ad Qc Js 9h'));
+  assert.ok(ev('Kh Kd 2c 2s 3h') > ev('Qh Qd Jc Js Ah'));
+  assert.ok(ev('3h 3d 3c 2s 2h') > ev('2h 2d 2c As Ah'));
+  assert.ok(ev('6h 2d 3c 4s 5h') > ev('Ah 2d 3c 4s 5h')); // six-high beats the wheel
+  assert.ok(ev('Ah Kd Qc Js Th') > ev('Kh Qd Jc Ts 9h'));
+  assert.ok(ev('Ah 9h 7h 5h 3h') > ev('Kd Qd Jd 9d 8d'));
+  assert.equal(ev('Ah Kd 9c 5s 3h'), ev('As Kc 9d 5h 3d')); // suits never break ties
+  assert.ok(ev('Ah Kd 9c 5s 4h') > ev('Ah Kd 9c 5s 3h'));
+  assert.notEqual(handCategory(ev('Qh Kd Ac 2s 3h')), 4); // no wrap-around straights
+});
+
+test('hand names', () => {
+  assert.equal(handName(ev('Th Jh Qh Kh Ah')), 'Royal flush');
+  assert.equal(handName(ev('Kh Kd Kc 2s 2h')), 'Full house, Kings over Twos');
+  assert.equal(handName(ev('6h 6d Kc 2s 3h')), 'Pair of Sixes');
+  assert.equal(handName(ev('Ah 2d 3c 4s 5h')), 'Straight, Five high');
+});
+
+// ---------- Hold'em and Omaha ----------
+
+test("Hold'em uses any combination, including playing the board", () => {
+  const board = h('Ts Js Qs Ks As');
+  assert.equal(handName(bestHoldem(h('2c 3d'), board).score), 'Royal flush');
+  // one hole card is enough for a flush in Hold'em
+  assert.equal(handCategory(bestHoldem(h('Ah 2c'), h('Kh 9h 5h 3h 8d')).score), 5);
+});
+
+test('Omaha must use exactly two hole cards and three board cards', () => {
+  // four hearts on board, one heart in hand: no flush in Omaha
+  const r = bestOmaha(h('Ah Kd 2c 3c'), h('Qh 9h 5h 4h 8d'));
+  assert.notEqual(handCategory(r.score), 5);
+  // a royal flush on the board can't be played
+  const r2 = bestOmaha(h('2c 3d 4c 7d'), h('Ts Js Qs Ks As'));
+  assert.ok(handCategory(r2.score) < 4);
+  // quads on board: only three of them play, with a pocket pair for a full house
+  assert.equal(handName(bestOmaha(h('Kc Kd 2c 3d'), h('9s 9h 9d 9c 4s')).score), 'Full house, Nines over Kings');
+  // three hole cards of one suit still only count two
+  assert.notEqual(handCategory(bestOmaha(h('Ah Kh Qh 2c'), h('Jh Td 5h 4c 8d')).score), 5);
+  assert.equal(handCategory(bestOmaha(h('Ah Kh Qh 2c'), h('Jh Td 5h 4h 8d')).score), 5);
+  // the returned five really are 2 from hand + 3 from board
+  const hole = h('Ah Kh Qd 2c');
+  const board = h('Jh Td 5h 4h 8d');
+  const best = bestOmaha(hole, board);
+  assert.equal(best.cards.filter((c) => hole.includes(c)).length, 2);
+  assert.equal(best.cards.filter((c) => board.includes(c)).length, 3);
+});
+
+// ---------- deck limits ----------
+
+test('crossword player limits match the spec table', () => {
+  const table = [[2, true, 12], [2, false, 13], [4, true, 5], [4, false, 6], [5, true, 4], [5, false, 5]];
+  for (const [hole, co, max] of table) {
+    assert.equal(crosswordMaxPlayers(hole, co), max);
+    for (const layout of ['crossword', 'slots']) {
+      const rules = { ...DEFAULT_RULES, hole, carryover: co, layout, boards: 5 };
+      const ok = planGame(rules, max);
+      assert.ok(ok.ok && ok.rows === 5, `${layout} ${hole} ${co} at max`);
+      const over = planGame(rules, max + 1);
+      if (layout === 'crossword') {
+        assert.equal(over.ok, false);
+        assert.match(over.reason, new RegExp(`maxes out at ${max} players`));
+      } else {
+        assert.ok(over.ok && over.rows < 5 && over.notes.length > 0);
+      }
+    }
+  }
+});
+
+test('slots drops boards one at a time and blocks when none fit', () => {
+  const rules = { ...DEFAULT_RULES, hole: 5, carryover: false, layout: 'slots', boards: 5 };
+  assert.deepEqual([5, 6, 7, 8, 9].map((n) => planGame(rules, n).rows), [5, 4, 3, 2, 1]);
+  const blocked = planGame(rules, 10);
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.reason, /no room/);
+  assert.equal(planGame(rules, 1).ok, false);
+});
+
+test('burn is the first thing dropped', () => {
+  const rules = { ...DEFAULT_RULES, hole: 2, carryover: true, layout: 'crossword' };
+  assert.equal(planGame(rules, 12).burn, true); // 25 + 24 + 2 = 51, room for the burn
+  const r4 = { ...DEFAULT_RULES, hole: 4, carryover: false, layout: 'slots', boards: 5 };
+  assert.equal(planGame(r4, 8).cardsUsed, 52); // 32 + 20 = 52, no burn
+  assert.equal(planGame(r4, 8).burn, false);
+  assert.equal(planGame(r4, 8).rows, 4);
+});
+
+// ---------- dealing ----------
+
+test('every dealt card is unique and the reveal order is flop, turn, river', () => {
+  const rules = { ...DEFAULT_RULES, hole: 4, carryover: true, layout: 'crossword' };
+  const plan = planGame(rules, 5);
+  const deck = makeDeck();
+  const d = dealGame(rules, plan, ['a', 'b', 'c', 'd', 'e'], deck);
+  const all = [...Object.values(d.hole).flat(), ...d.carryHole, d.burn, ...d.grid.flat()];
+  assert.equal(all.length, 50);
+  assert.equal(new Set(all).size, 50);
+  // with an unshuffled deck: 24 hole cards, 1 burn, then 15 flop, 5 turn, 5 river
+  assert.deepEqual(d.grid[0].slice(0, 3), deck.slice(25, 28));
+  assert.deepEqual(d.grid[1].slice(0, 3), deck.slice(28, 31));
+  assert.deepEqual(d.grid.map((r) => r[3]), deck.slice(40, 45));
+  assert.deepEqual(d.grid.map((r) => r[4]), deck.slice(45, 50));
+  const boards = boardsOf(d.grid, 'crossword');
+  assert.equal(boards.length, 10);
+  assert.deepEqual(boards[5], d.grid.map((r) => r[0])); // 1 Down is column 1
+  assert.equal(new Set(shuffle(deck, seeded(1))).size, 52);
+});
+
+// ---------- stakes, splits, carryover ----------
+
+test('stake examples from the spec', () => {
+  const slots = planGame({ ...DEFAULT_RULES, hole: 2, layout: 'slots', boards: 5, stakeCents: 200 }, 5);
+  assert.deepEqual(slots.pots, [200, 200, 200, 200, 200]);
+  const cw = planGame({ ...DEFAULT_RULES, hole: 2, layout: 'crossword', stakeCents: 200 }, 5);
+  assert.equal(cw.perPlayer, 400);
+  assert.deepEqual(cw.pots, Array(10).fill(200));
+  // uneven: 3 players x $1 over 5 boards -> extra cents on the lowest boards
+  assert.deepEqual(splitEven(301, 5), [61, 60, 60, 60, 60]);
+  assert.deepEqual(splitEven(100, 3), [34, 33, 33]);
+});
+
+test('board pays the best hand, ties split, carryover share is kept apart', () => {
+  const board = [h('Ks Kd 7c 4h 2s')];
+  const hands = [
+    { id: 'a', cards: h('Ah Kc') },
+    { id: 'b', cards: h('Ad Kh') },
+    { id: 'c', cards: h('Qh Qc') },
+  ];
+  const { results, deltas } = resolveBoards(board, [1001], hands, 2);
+  assert.equal(results[0].handName, 'Three Kings');
+  assert.deepEqual(deltas, { a: 501, b: 500, c: 0 });
+  // carryover hand ties with a: it is last in line for the odd cent
+  const hands2 = [{ id: 'a', cards: h('Ah Kc') }, { id: 'c', cards: h('Qh Qc') }, { id: CARRY_ID, cards: h('Ad Kh') }];
+  const r2 = resolveBoards(board, [1001], hands2, 2);
+  assert.deepEqual(r2.deltas, { a: 501, c: 0, [CARRY_ID]: 500 });
+});
+
+test('settle-up transfers clear every balance', () => {
+  const bal = [
+    { name: 'A', cents: 1250 }, { name: 'B', cents: -700 }, { name: 'C', cents: -900 },
+    { name: 'D', cents: 350 }, { name: 'E', cents: 0 },
+  ];
+  const tx = settleUp(bal);
+  const net = Object.fromEntries(bal.map((b) => [b.name, b.cents]));
+  for (const t of tx) { net[t.from] += t.cents; net[t.to] -= t.cents; assert.ok(t.cents > 0); }
+  assert.ok(Object.values(net).every((v) => v === 0));
+  assert.ok(tx.length <= 3);
+});
+
+test('auto discard keeps the strong cards', () => {
+  assert.equal(autoDiscard(h('As Ah Ks Kh 7d')), 4);
+  // after the flop it keeps what makes a hand on the visible boards
+  const idx = autoDiscard(h('2c 9h 9d Ac Kc'), [h('9s 9c 4d'), h('Qh Jd 3s')]);
+  assert.equal(idx, 0);
+});
+
+// ---------- full sessions ----------
+
+function playGame(s, rnd) {
+  assert.deepEqual(deal(s, rnd), { ok: true });
+  let guard = 0;
+  while (s.game.stage !== 'done') {
+    const r = advance(s);
+    if (r.error) {
+      // humans discard their first card
+      for (const id of s.game.order) discard(s, id, 0);
+      autoDiscardRest(s);
+    }
+    assert.ok(guard++ < 50);
+  }
+}
+
+const chipTotal = (s) => s.players.reduce((a, p) => a + p.balance, 0) + s.carry.reduce((a, b) => a + b, 0);
+
+test('chips are conserved across every option combination', () => {
+  let seed = 1;
+  for (const hole of [2, 4, 5]) {
+    for (const layout of ['slots', 'crossword']) {
+      for (const carryover of [true, false]) {
+        for (const discardTiming of hole === 5 ? ['pre', 'post'] : ['pre']) {
+          const s = newSession('TEST', 'host', 'Host');
+          const n = Math.min(4, crosswordMaxPlayers(hole, carryover));
+          for (let i = 1; i < n; i++) (i % 2 ? addPlayer(s, `p${i}`, `P${i}`) : addBot(s));
+          assert.deepEqual(setRules(s, { hole, layout, carryover, discardTiming, boards: 5, stakeCents: 137 }), { ok: true });
+          const rnd = seeded(seed++);
+          for (let gme = 0; gme < 25; gme++) {
+            playGame(s, rnd);
+            assert.equal(chipTotal(s), 0, `${hole}/${layout}/${carryover}/${discardTiming} game ${gme}`);
+            const g = s.game;
+            const paid = g.results.reduce((a, r) => a + r.winners.reduce((x, w) => x + w.cents, 0), 0);
+            assert.equal(paid, g.plan.pots.reduce((a, b) => a + b, 0));
+            assert.equal(g.results.length, layout === 'crossword' ? 10 : 5);
+            if (!carryover) assert.ok(!carryLocked(s));
+            if (hole === 5) {
+              for (const id of g.order) assert.ok(Number.isInteger(g.discard[id]));
+              if (carryover) assert.ok(Number.isInteger(g.carryDiscard));
+            }
+          }
+          assert.deepEqual(endSession(s), { ok: true });
+          assert.equal(s.players.reduce((a, p) => a + p.balance, 0), 0);
+          const net = Object.fromEntries(s.players.map((p) => [p.name, p.balance]));
+          for (const t of s.settle) { net[t.from] += t.cents; net[t.to] -= t.cents; }
+          assert.ok(Object.values(net).every((v) => v === 0));
+        }
+      }
+    }
+  }
+});
+
+test('a carried pot lands on the same board next game and locks the rules', () => {
+  const rnd = seeded(99);
+  let found = false;
+  for (let attempt = 0; attempt < 200 && !found; attempt++) {
+    const s = newSession('TEST', 'host', 'Host');
+    addBot(s);
+    setRules(s, { hole: 2, layout: 'crossword', carryover: true, stakeCents: 500 });
+    playGame(s, rnd);
+    if (!carryLocked(s)) continue;
+    found = true;
+    const carried = s.carry.slice();
+    for (const r of s.game.results) {
+      const share = r.winners.filter((w) => w.id === CARRY_ID).reduce((a, w) => a + w.cents, 0);
+      assert.equal(carried[r.index], share);
+    }
+    toLobby(s);
+    assert.match(setRules(s, { layout: 'slots' }).error, /locked/);
+    assert.match(setRules(s, { carryover: false }).error, /locked/);
+    assert.equal(s.rules.layout, 'crossword');
+    playGame(s, rnd);
+    s.game.plan.pots.forEach((pot, i) => assert.equal(pot, 200 + carried[i]));
+    assert.equal(chipTotal(s), 0);
+  }
+  assert.ok(found, 'carryover hand never won in 200 games');
+});
+
+test('a carried slots pot blocks the deal when its board no longer fits', () => {
+  const s = newSession('TEST', 'host', 'Host');
+  for (let i = 0; i < 3; i++) addBot(s);
+  setRules(s, { hole: 5, layout: 'slots', carryover: true, boards: 5 });
+  s.carry[4] = 300; // pretend the Carryover hand won board 5
+  s.players[0].balance = -300;
+  assert.equal(viewFor(s, 'host').plan.ok, true);
+  addBot(s); // 5 players + carryover hand with 5 cards: only 4 boards fit
+  const v = viewFor(s, 'host');
+  assert.equal(v.plan.ok, false);
+  assert.match(v.plan.reason, /Board 5/);
+  assert.match(deal(s, seeded(1)).error, /Board 5/);
+  removePlayer(s, 'bot4');
+  assert.deepEqual(deal(s, seeded(1)), { ok: true });
+  assert.equal(s.game.plan.pots[4], 160 + 300);
+});
+
+test('ending with a pending carryover refunds it', () => {
+  const s = newSession('TEST', 'host', 'Host');
+  addBot(s);
+  s.carry[2] = 301;
+  s.players[0].balance = -200;
+  s.players[1].balance = -101;
+  endSession(s);
+  assert.equal(s.refund.total, 301);
+  assert.deepEqual(s.players.map((p) => p.balance), [-49, 49]);
+  assert.deepEqual(s.settle, [{ from: 'Host', to: 'CPU 1', cents: 49 }]);
+});
+
+test('hole cards stay private until the showdown', () => {
+  const s = newSession('TEST', 'host', 'Host');
+  addPlayer(s, 'p1', 'Pat');
+  addPlayer(s, 'p2', 'Sam');
+  setRules(s, { hole: 5, layout: 'crossword', carryover: true, discardTiming: 'post' });
+  deal(s, seeded(7));
+  const g = s.game;
+  for (const stage of ['pre', 'flop', 'turn', 'river']) {
+    assert.equal(g.stage, stage);
+    const visibleCols = { pre: 0, flop: 3, turn: 4, river: 5 }[stage];
+    for (const id of ['host', 'p1', 'p2', 'stranger']) {
+      const json = JSON.stringify(viewFor(s, id));
+      const hidden = [
+        ...g.order.filter((o) => o !== id).flatMap((o) => g.hole[o]),
+        ...g.carryHole,
+        g.burn,
+        ...g.grid.flatMap((row) => row.slice(visibleCols)),
+      ];
+      for (const c of hidden) assert.ok(!json.includes(`"${c}"`), `${id} can see ${c} at ${stage}`);
+      if (g.hole[id]) for (const c of g.hole[id]) assert.ok(json.includes(`"${c}"`));
+    }
+    if (stage === 'flop') {
+      assert.match(advance(s).error, /discards/);
+      assert.equal(viewFor(s, 'p1').game.needDiscard, true);
+      for (const id of g.order) assert.deepEqual(discard(s, id, 2), { ok: true });
+      assert.match(discard(s, 'p1', 1).error, /already/);
+    }
+    advance(s);
+  }
+  assert.equal(g.stage, 'showdown');
+  const v = viewFor(s, 'p1');
+  assert.equal(v.game.hands.length, 4);
+  assert.equal(v.game.hands[0].cards.length, 4);
+  assert.equal(v.game.results.length, 1); // boards are paid one at a time
+  // balances shown during the payout only include boards already paid
+  const shown = v.players.reduce((a, p) => a + p.balance, 0);
+  const paidSoFar = v.game.results[0].winners.filter((w) => w.id !== CARRY_ID).reduce((a, w) => a + w.cents, 0);
+  assert.equal(shown, paidSoFar - 3 * g.plan.perPlayer);
+});
+
+test('players can join mid-game and sit out until the next deal', () => {
+  const s = newSession('TEST', 'host', 'Host');
+  addBot(s);
+  deal(s, seeded(3));
+  addPlayer(s, 'late', 'Late');
+  assert.equal(viewFor(s, 'late').game.myHole, null);
+  assert.match(removePlayer(s, 'bot1').error, /finishes/);
+  while (s.game.stage !== 'done') advance(s);
+  deal(s, seeded(4));
+  assert.equal(s.game.order.length, 3);
+});
