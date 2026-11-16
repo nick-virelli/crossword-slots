@@ -42,38 +42,50 @@ const rv = (c) => RANKS.indexOf(c[0]) + 2;
 const B = 15;
 const CAT = B ** 5;
 
-// Score for exactly 5 cards. Higher is better; equal scores are an exact tie.
+// Cards as small integers for speed: (rank 2-14) * 4 + suit.
+const ci = (c) => ((RANKS.indexOf(c[0]) + 2) << 2) | SUITS.indexOf(c[1]);
+export const toInts = (cards) => cards.map(ci);
+
+// Score for exactly 5 cards (integer form). Higher is better; equal scores are an exact tie.
+export function eval5i(c0, c1, c2, c3, c4) {
+  let a = c0 >> 2, b = c1 >> 2, c = c2 >> 2, d = c3 >> 2, e = c4 >> 2, t;
+  // sorting network, descending
+  if (a < b) { t = a; a = b; b = t; }
+  if (d < e) { t = d; d = e; e = t; }
+  if (c < e) { t = c; c = e; e = t; }
+  if (c < d) { t = c; c = d; d = t; }
+  if (b < e) { t = b; b = e; e = t; }
+  if (a < d) { t = a; a = d; d = t; }
+  if (a < c) { t = a; a = c; c = t; }
+  if (b < d) { t = b; b = d; d = t; }
+  if (b < c) { t = b; b = c; c = t; }
+  let cat, t0, t1, t2, t3, t4;
+  if (a === d) { cat = 7; t0 = t1 = t2 = t3 = a; t4 = e; }
+  else if (b === e) { cat = 7; t0 = t1 = t2 = t3 = b; t4 = a; }
+  else if (a === c && d === e) { cat = 6; t0 = t1 = t2 = a; t3 = t4 = d; }
+  else if (a === b && c === e) { cat = 6; t0 = t1 = t2 = c; t3 = t4 = a; }
+  else if (a === c) { cat = 3; t0 = t1 = t2 = a; t3 = d; t4 = e; }
+  else if (b === d) { cat = 3; t0 = t1 = t2 = b; t3 = a; t4 = e; }
+  else if (c === e) { cat = 3; t0 = t1 = t2 = c; t3 = a; t4 = b; }
+  else if (a === b && c === d) { cat = 2; t0 = t1 = a; t2 = t3 = c; t4 = e; }
+  else if (a === b && d === e) { cat = 2; t0 = t1 = a; t2 = t3 = d; t4 = c; }
+  else if (b === c && d === e) { cat = 2; t0 = t1 = b; t2 = t3 = d; t4 = a; }
+  else if (a === b) { cat = 1; t0 = t1 = a; t2 = c; t3 = d; t4 = e; }
+  else if (b === c) { cat = 1; t0 = t1 = b; t2 = a; t3 = d; t4 = e; }
+  else if (c === d) { cat = 1; t0 = t1 = c; t2 = a; t3 = b; t4 = e; }
+  else if (d === e) { cat = 1; t0 = t1 = d; t2 = a; t3 = b; t4 = c; }
+  else {
+    const s = c0 & 3;
+    const flush = (c1 & 3) === s && (c2 & 3) === s && (c3 & 3) === s && (c4 & 3) === s;
+    const hi = a - e === 4 ? a : (a === 14 && b === 5 ? 5 : 0); // wheel counts as five-high
+    if (hi) { cat = flush ? 8 : 4; t0 = hi; t1 = t2 = t3 = t4 = 0; }
+    else { cat = flush ? 5 : 0; t0 = a; t1 = b; t2 = c; t3 = d; t4 = e; }
+  }
+  return ((((cat * B + t0) * B + t1) * B + t2) * B + t3) * B + t4;
+}
+
 export function evaluate5(cards) {
-  const vals = cards.map(rv).sort((a, b) => b - a);
-  const flush = cards.every((c) => c[1] === cards[0][1]);
-  const counts = new Map();
-  for (const v of vals) counts.set(v, (counts.get(v) || 0) + 1);
-  const groups = [...counts.entries()].sort((a, b) => b[1] - a[1] || b[0] - a[0]);
-  let straightHigh = 0;
-  if (groups.length === 5) {
-    if (vals[0] - vals[4] === 4) straightHigh = vals[0];
-    else if (vals[0] === 14 && vals[1] === 5 && vals[4] === 2) straightHigh = 5; // wheel
-  }
-  let cat;
-  let tb;
-  if (straightHigh) {
-    cat = flush ? 8 : 4;
-    tb = [straightHigh, 0, 0, 0, 0];
-  } else {
-    const shape = groups.map((g) => g[1]).join('');
-    if (shape === '41') cat = 7;
-    else if (shape === '32') cat = 6;
-    else if (flush) cat = 5;
-    else if (shape === '311') cat = 3;
-    else if (shape === '221') cat = 2;
-    else if (shape === '2111') cat = 1;
-    else cat = 0;
-    tb = [];
-    for (const [v, n] of groups) for (let i = 0; i < n; i++) tb.push(v);
-  }
-  let score = cat;
-  for (const v of tb) score = score * B + v;
-  return score;
+  return eval5i(ci(cards[0]), ci(cards[1]), ci(cards[2]), ci(cards[3]), ci(cards[4]));
 }
 
 export function handCategory(score) {
@@ -117,46 +129,80 @@ export function combos(arr, k) {
   return out;
 }
 
-// Hold'em: best 5 from hole + board, any combination.
-export function bestHoldem(hole, board) {
+// How hole cards may be used:
+//   'any'   - 0, 1 or 2 hole cards with 5, 4 or 3 board cards (Hold'em, 5-Card Any)
+//   'exact' - exactly 2 hole cards and exactly 3 board cards (Omaha, Pineapple)
+const idxCache = new Map();
+function idxCombos(n, k) {
+  const key = n * 8 + k;
+  if (!idxCache.has(key)) idxCache.set(key, combos(Array.from({ length: n }, (_, i) => i), k));
+  return idxCache.get(key);
+}
+const holeCounts = (mode) => (mode === 'exact' ? [2] : [0, 1, 2]);
+
+export function bestHand(hole, board, mode) {
   let best = null;
-  for (const five of combos([...hole, ...board], 5)) {
-    const score = evaluate5(five);
-    if (!best || score > best.score) best = { score, cards: five };
+  for (const h of holeCounts(mode)) {
+    if (h > hole.length || 5 - h > board.length) continue;
+    for (const hi of idxCombos(hole.length, h)) {
+      for (const bi of idxCombos(board.length, 5 - h)) {
+        const five = [...hi.map((i) => hole[i]), ...bi.map((i) => board[i])];
+        const score = evaluate5(five);
+        if (!best || score > best.score) best = { score, cards: five };
+      }
+    }
   }
   return best;
 }
+export const bestHoldem = (hole, board) => bestHand(hole, board, 'any');
+export const bestOmaha = (hole, board) => bestHand(hole, board, 'exact');
 
-// Omaha: exactly 2 hole cards and exactly 3 board cards.
-export function bestOmaha(hole, board) {
-  let best = null;
-  const boards3 = combos(board, 3);
-  for (const two of combos(hole, 2)) {
-    for (const three of boards3) {
-      const five = [...two, ...three];
-      const score = evaluate5(five);
-      if (!best || score > best.score) best = { score, cards: five };
+// Same as bestHand but on integer cards and returning only the score. board must have 5 cards.
+export function bestScoreI(hole, board, mode) {
+  let best = 0;
+  const n = hole.length;
+  if (mode !== 'exact') {
+    best = eval5i(board[0], board[1], board[2], board[3], board[4]);
+    for (let i = 0; i < n; i++) {
+      for (let x = 0; x < 5; x++) { // leave out board card x
+        const s = eval5i(hole[i], board[x === 0 ? 1 : 0], board[x <= 1 ? 2 : 1], board[x <= 2 ? 3 : 2], board[x <= 3 ? 4 : 3]);
+        if (s > best) best = s;
+      }
+    }
+  }
+  const triples = idxCombos(5, 3);
+  for (let i = 0; i < n - 1; i++) {
+    for (let j = i + 1; j < n; j++) {
+      for (let k = 0; k < 10; k++) {
+        const t = triples[k];
+        const s = eval5i(hole[i], hole[j], board[t[0]], board[t[1]], board[t[2]]);
+        if (s > best) best = s;
+      }
     }
   }
   return best;
 }
 
-export function bestHand(hole, board, holeCount) {
-  return holeCount === 2 ? bestHoldem(hole, board) : bestOmaha(hole, board);
+export const playMode = (rules) => (rules.hole === 2 || rules.free ? 'any' : 'exact');
+export const needsDiscard = (rules) => rules.hole === 5 && !rules.free;
+export function variantName(rules) {
+  if (rules.hole === 2) return "Hold'em";
+  if (rules.hole === 4) return 'Omaha';
+  return rules.free ? '5-Card Any' : 'Pineapple Omaha';
 }
 
 // ---------- rules, deck limits, pots ----------
 
 export const DEFAULT_RULES = {
-  hole: 4,              // 2 Hold'em, 4 Omaha, 5 Pineapple Omaha
+  hole: 4,              // 2 Hold'em, 4 Omaha, 5 Pineapple Omaha or 5-Card Any
+  free: false,          // 5 cards only: keep all five and use 0-2 of them (no discard)
+  showOdds: true,       // show live win percentages
   discardTiming: 'pre', // 'pre' = before the flop, 'post' = after the flop (5 cards only)
   layout: 'slots',      // 'slots' | 'crossword'
   boards: 5,            // slots only: boards wanted (1-5)
   stakeCents: 200,
   carryover: false,
 };
-
-export const HOLE_NAMES = { 2: "Hold'em", 4: 'Omaha', 5: 'Pineapple Omaha' };
 
 export function money(cents) {
   const neg = cents < 0;
@@ -255,11 +301,11 @@ export function boardsOf(grid, layout) {
 }
 
 // Pay every board. hands: [{id, cards}] in seat order, Carryover hand (if any) last.
-export function resolveBoards(boards, pots, hands, holeCount) {
+export function resolveBoards(boards, pots, hands, mode) {
   const deltas = {};
   for (const h of hands) deltas[h.id] = 0;
   const results = boards.map((board, i) => {
-    const scored = hands.map((h) => ({ id: h.id, ...bestHand(h.cards, board, holeCount) }));
+    const scored = hands.map((h) => ({ id: h.id, ...bestHand(h.cards, board, mode) }));
     const top = Math.max(...scored.map((s) => s.score));
     const winners = scored.filter((s) => s.score === top);
     const shares = splitEven(pots[i], winners.length);
@@ -270,6 +316,7 @@ export function resolveBoards(boards, pots, hands, holeCount) {
       score: top,
       handName: handName(top),
       winners: winners.map((w) => ({ id: w.id, cents: w.cents, cards: w.cards })),
+      all: scored.slice().sort((x, y) => y.score - x.score).map((x) => ({ id: x.id, score: x.score, cards: x.cards })),
     };
   });
   return { results, deltas };

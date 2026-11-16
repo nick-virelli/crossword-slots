@@ -158,3 +158,41 @@ table.sum td:last-child { text-align: right; font-variant-numeric: tabular-nums;
 #toast { position: fixed; left: 50%; top: 14px; transform: translateX(-50%); background: #111; color: #fff; padding: 10px 16px; border-radius: 999px; font-size: 14px; z-index: 10; max-width: 90vw; text-align: center; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5); }
 .settle li { padding: 9px 0; }
 .settle .arrow { color: var(--gold); padding: 0 6px; }
+
+/* ---- V2 ---- */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.pill { border: 1px solid var(--line); background: rgba(0, 0, 0, 0.3); border-radius: 999px; padding: 7px 13px; font-size: 14px; }
+.who { display: flex; flex-direction: column; gap: 8px; }
+.whob { display: flex; flex-direction: column; align-items: flex-start; text-align: left; width: 100%; border: 1px solid rgba(245, 200, 75, 0.45); background: rgba(245, 200, 75, 0.1); border-radius: 12px; padding: 11px 14px; }
+.whob b { font-size: 17px; }
+.whob span { font-size: 12px; color: var(--mute); }
+.x.wide { width: auto; border-radius: 999px; padding: 0 10px; font-size: 12px; }
+
+button.glab { border: 0; background: transparent; padding: 2px 0; font: inherit; font-size: 11px; cursor: pointer; }
+.glab.top { flex-direction: column; gap: 0; height: auto; padding-bottom: 3px; }
+.glab .pc { color: var(--good); font-weight: 800; font-size: 12px; }
+.glab.pick { background: rgba(255, 255, 255, 0.14); outline: 1.5px solid rgba(255, 255, 255, 0.5); }
+.card.pick { box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.85), 0 2px 5px rgba(0, 0, 0, 0.4); }
+.slot.pick { border-color: rgba(255, 255, 255, 0.6); }
+.hint { text-align: center; font-size: 12px; color: var(--mute); margin: -4px 0 8px; }
+.detail { border-color: rgba(255, 255, 255, 0.35); animation: pop 0.2s both; }
+.plist li.winner { background: rgba(245, 200, 75, 0.1); border-radius: 8px; padding-left: 6px; padding-right: 6px; }
+
+.orow { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 14px; }
+.orow .nm { width: 34%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.orow .track { flex: 1; height: 9px; border-radius: 5px; background: rgba(255, 255, 255, 0.1); overflow: hidden; }
+.orow .track i { display: block; height: 100%; background: var(--good); border-radius: 5px; transition: width 0.4s; }
+.orow b { width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+.orow.pk .nm, .orow.pk b { color: var(--gold); }
+.orow.pk .track i { background: var(--gold); }
+
+.hand.n5 .card { --cw: 54px; }
+table.sum tr { cursor: pointer; }
+
+details.hist summary { cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--mute); font-weight: 700; }
+.hist h3 { font-size: 12px; margin: 12px 0 4px; color: var(--ink); }
+.hrow { padding: 6px 0; border-bottom: 1px solid var(--line); }
+.hrow:last-child { border-bottom: 0; }
+.hc { display: inline-block; font-size: 12.5px; margin: 2px 8px 0 0; font-variant-numeric: tabular-nums; }
+.hc.pos { color: var(--good); }
+.hc.neg { color: var(--bad); }
