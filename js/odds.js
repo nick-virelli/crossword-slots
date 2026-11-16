@@ -1,7 +1,7 @@
 // Crossword Slots — live win odds. Runs on the host's phone, which knows every hand,
 // so these are true odds (like the percentages on TV poker), not guesses.
 
-import { toInts, bestScoreI, combos, bestHand, handName, handCategory } from './engine.js';
+import { toInts, bestScoreI, combos, bestHand, handName, handCategory } from './engine.js?v=1794812783';
 
 // hands:  [{ id, cards }] every hand in play, the Pocket included
 // mode:   'any' | 'exact'

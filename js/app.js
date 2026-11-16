@@ -2,9 +2,9 @@
 // The host's phone runs the game (session.js) and sends every other phone only what
 // that player is allowed to see. Phones talk directly to each other through PeerJS.
 
-import * as S from './session.js';
-import { cryptoRnd, money, variantName, CARRY_ID, makeDeck, playMode } from './engine.js';
-import { outlook } from './odds.js';
+import * as S from './session.js?v=1794812783';
+import { cryptoRnd, money, variantName, CARRY_ID, makeDeck, playMode } from './engine.js?v=1794812783';
+import { outlook } from './odds.js?v=1794812783';
 
 const PEER_PREFIX = 'xwslots-v1-';
 const PAY_MS = 3200;

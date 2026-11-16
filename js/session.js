@@ -7,8 +7,8 @@
 import {
   CARRY_ID, DEFAULT_RULES, makeDeck, shuffle, planGame, dealGame, boardsOf, resolveBoards,
   autoDiscard, settleUp, splitEven, boardLabel, playMode, needsDiscard, variantName, handName,
-} from './engine.js';
-import { computeOdds } from './odds.js';
+} from './engine.js?v=1794812783';
+import { computeOdds } from './odds.js?v=1794812783';
 
 const STAGE_COLS = { pre: 0, flop: 3, turn: 4, river: 5, showdown: 5, done: 5 };
 export const POCKET_NAME = 'The Pocket';
