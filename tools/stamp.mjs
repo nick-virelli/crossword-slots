@@ -9,7 +9,7 @@ const edit = (path, fn) => {
   writeFileSync(url, fn(readFileSync(url, 'utf8')));
 };
 
-edit('index.html', (s) => s.replace(/((?:src|href)="(?:js\/app\.js|style\.css|vendor\/peerjs\.min\.js))(?:\?v=\d+)?"/g, `$1?v=${v}"`));
+edit('index.html', (s) => s.replace(/((?:src|href)="(?:js\/app\.js|style\.css|vendor\/peerjs\.min\.js|vendor\/qrcode\.js))(?:\?v=\d+)?"/g, `$1?v=${v}"`));
 for (const f of readdirSync(new URL('js/', root))) {
   edit(`js/${f}`, (s) => s.replace(/(from '\.\/[\w-]+\.js)(?:\?v=\d+)?'/g, `$1?v=${v}'`));
 }

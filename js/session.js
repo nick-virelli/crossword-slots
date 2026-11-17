@@ -10,9 +10,9 @@
 
 import {
   CARRY_ID, DEFAULT_RULES, makeDeck, shuffle, planGame, dealGame, boardsOf, resolveBoards,
-  autoDiscard, settleUp, splitEven, boardLabel, playMode, needsDiscard, variantName, handName, money,
-} from './engine.js?v=1794870668';
-import { computeOdds } from './odds.js?v=1794870668';
+  autoDiscard, settleUp, splitEven, boardLabel, playMode, needsDiscard, variantName, handName, money, presetById, presetOf,
+} from './engine.js?v=1794875077';
+import { computeOdds } from './odds.js?v=1794875077';
 
 export const SESSION_VERSION = 3;
 export const POCKET_NAME = 'The Pocket';
@@ -184,6 +184,12 @@ export function setRules(s, patch) {
     return OK;
   }
   if (carryLocked(s)) return err('Rules are locked until the carryover pot has been played out.');
+  const preset = presetById(patch.preset);
+  if (preset) { // a built-in game: sets its rules and is remembered as the starting point
+    s.rules = { ...s.rules, ...preset.rules };
+    s.preset = preset.id;
+    return OK;
+  }
   const r = { ...s.rules };
   if ([2, 4, 5].includes(patch.hole)) { r.hole = patch.hole; r.free = patch.hole === 5 && !!patch.free; }
   if (['pre', 'post'].includes(patch.discardTiming)) r.discardTiming = patch.discardTiming;
@@ -485,6 +491,8 @@ export function viewFor(s, pid, online = new Set(), extra = {}) {
     you: me ? me.id : null,
     sitOut: !!me && me.sitOut,
     rules: s.rules,
+    preset: presetOf(s.rules),                 // the built-in game these rules match, if any
+    presetFrom: presetById(s.preset) ? s.preset : null, // the built-in game last picked
     oddsOn: oddsOn(s),
     locked: carryLocked(s),
     plan: null,

@@ -17,4 +17,5 @@ Before every release run `node tools/stamp.mjs` (version-stamps file references 
 - All money is integer cents.
 
 ## Temporary
-- The five looks in `style.css` and the Look picker in the settings sheet (`THEMES` in `js/app.js`) are a tryout. Once one is chosen, delete the others and hard-code the winner.
+- The looks in `style.css` and the Look picker in the settings sheet (`THEMES` in `js/app.js`) are permanent: every player picks their own. Any new screen or element must be checked in every look. The Pixel look also has a moving background (`js/bgfx.js`), pixel suit shapes and a bundled font (`vendor/fonts/jersey10.woff2`, Open Font License). It is an original pixel-art style: do not copy another game's name, logo, art or fonts into it.
+- Built-in games are `PRESETS` in `js/engine.js`. All have Carryover on and use Crossword or Slots × 5. Stake and win % are not part of a preset. There is no saving of custom presets.

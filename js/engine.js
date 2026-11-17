@@ -193,6 +193,23 @@ export function variantName(rules) {
 
 // ---------- rules, deck limits, pots ----------
 
+// Built-in games. Picking one sets these rules (the stake and win % are left alone).
+// Every preset has Carryover on; it can still be switched off, which makes it a custom game.
+export const PRESETS = [
+  { id: 'tiffany', name: 'Tiffany Day', rules: { hole: 5, free: false, discardTiming: 'post', layout: 'crossword', carryover: true } },
+  { id: 'keep', name: "Keep 'Em All", rules: { hole: 5, free: true, layout: 'crossword', carryover: true } },
+  { id: 'classic', name: 'Crossword Classic', rules: { hole: 4, free: false, layout: 'crossword', carryover: true } },
+  { id: 'omaha', name: 'Omaha Slots', rules: { hole: 4, free: false, layout: 'slots', boards: 5, carryover: true } },
+  { id: 'texas', name: 'Texas Crossword', rules: { hole: 2, free: false, layout: 'crossword', carryover: true } },
+  { id: 'holdem', name: "Hold'em Slots", rules: { hole: 2, free: false, layout: 'slots', boards: 5, carryover: true } },
+];
+export const presetById = (id) => PRESETS.find((p) => p.id === id) || null;
+// The preset these rules match exactly, or null when they are a custom mix.
+export function presetOf(rules) {
+  const hit = PRESETS.find((p) => Object.keys(p.rules).every((k) => rules[k] === p.rules[k]));
+  return hit ? hit.id : null;
+}
+
 export const DEFAULT_RULES = {
   hole: 4,              // 2 Hold'em, 4 Omaha, 5 Pineapple Omaha or 5-Card Any
   free: false,          // 5 cards only: keep all five and use 0-2 of them (no discard)

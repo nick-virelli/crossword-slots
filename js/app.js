@@ -4,9 +4,10 @@
 //
 // Words: a GAME is the whole sitting; a ROUND is one deal of the deck.
 
-import * as S from './session.js?v=1794870668';
-import { cryptoRnd, money, variantName, CARRY_ID, makeDeck, playMode } from './engine.js?v=1794870668';
-import { outlook } from './odds.js?v=1794870668';
+import * as S from './session.js?v=1794875077';
+import { cryptoRnd, money, variantName, CARRY_ID, makeDeck, playMode, PRESETS, presetById } from './engine.js?v=1794875077';
+import { syncBg } from './bgfx.js?v=1794875077';
+import { outlook } from './odds.js?v=1794875077';
 
 const PEER_PREFIX = 'xwslots-v1-';
 const AWAY_MSG = 'The host is away. The game is paused until they come back.';
@@ -44,15 +45,16 @@ const ui = { sel: null, seenGame: 0, seen: new Set(), board: null, sheet: null }
 
 // ---------- this phone's own settings: look, deck colours, sound ----------
 
-// TEMPORARY: five complete looks to choose between. Once one is picked, delete the others
-// from style.css, remove the Look picker from the settings sheet, and hard-code the winner.
-const THEMES = [['felt', 'Felt'], ['paper', 'Newsprint'], ['mono', 'Terminal'], ['neon', 'Neon'], ['block', 'Block']];
+// Looks. Every player picks their own in the settings sheet; it only changes their phone.
+// Each look is one block in style.css. A new look needs an entry here and a block there.
+const THEMES = [['felt', 'Felt'], ['pixel', 'Pixel'], ['paper', 'Newsprint'], ['mono', 'Terminal'], ['neon', 'Neon'], ['block', 'Block']];
 const prefs = { theme: 'felt', deck4: false, sound: true, ...(ls.json('xw_prefs') || {}) };
 function applyPrefs() {
   if (!THEMES.some((t) => t[0] === prefs.theme)) prefs.theme = 'felt';
   document.documentElement.dataset.theme = prefs.theme;
   document.documentElement.dataset.deck = prefs.deck4 ? '4' : '2';
   ls.set('xw_prefs', JSON.stringify(prefs));
+  syncBg();
 }
 applyPrefs();
 
@@ -69,6 +71,7 @@ const FX = {
   pocket: { tone: [[392, 0.12, 'sawtooth', 0.05], [311, 0.12, 'sawtooth', 0.05], [233, 0.28, 'sawtooth', 0.05]], vib: [80, 50, 80] }, // the Pocket took a board
   done: { tone: [[440, 0.08], [554, 0.1]], vib: [] },                          // round finished
   yourDeal: { tone: [[587, 0.08], [740, 0.08], [880, 0.14]], vib: [30, 30, 30] }, // the deal passed to you
+  preset: { tone: [[494, 0.06, 'triangle'], [740, 0.1, 'triangle']], vib: [15] },    // a built-in game was picked
   end: { tone: [[523, 0.1], [659, 0.1], [784, 0.1], [1047, 0.3]], vib: [50, 50, 120] }, // game over, settle up
 };
 let actx = null;
@@ -101,6 +104,7 @@ function fx(name, times = 1) {
 function diffFx(prev, next) {
   if (!prev || !next) return;
   if (prev.phase !== 'ended' && next.phase === 'ended') { fx('end'); return; }
+  if (next.phase === 'lobby' && next.preset && prev.preset !== next.preset) fx('preset');
   if (next.dealerRotate && prev.control !== next.control && next.control === next.you) fx('yourDeal');
   const pg = prev.game;
   const ng = next.game;
@@ -155,6 +159,12 @@ function pct(share) {
   if (share <= 0) return '0%';
   if (share < 0.01) return '<1%';
   return `${Math.min(99, Math.round(share * 100))}%`;
+}
+
+// "Tiffany Day", or "Custom (from Tiffany Day)" once any of its rules has been changed.
+function gameName() {
+  if (view.preset) return presetById(view.preset).name;
+  return view.presetFrom ? `Custom (from ${presetById(view.presetFrom).name})` : 'Custom';
 }
 
 function rulesLine(r, rows) {
@@ -568,6 +578,7 @@ const actions = {
     else patch = { [key]: Number(val) };
     ctl('rule', patch);
   },
+  preset(id) { ctl('rule', { preset: id }); },
   deal() { ui.sel = null; ui.board = null; ctl('deal'); },
   next() { ctl('next'); },
   autoDiscard() { ctl('autoDiscard'); },
@@ -640,6 +651,8 @@ function render() {
     else if (view.phase === 'lobby' || !view.game) body = renderLobby(host, ctrl);
     else body = renderTable(host, ctrl);
   }
+  const scene = view ? 'table' : 'home';
+  if (document.documentElement.dataset.scene !== scene) { document.documentElement.dataset.scene = scene; syncBg(); }
   $app.innerHTML = renderHeader() + body + renderSheet();
 }
 
@@ -712,7 +725,7 @@ function renderSheet() {
       <div class="row"><button class="btn grow" data-act="share">Share link</button><button class="btn ghost grow" data-act="copyLink">Copy link</button></div>`;
   } else if (ui.sheet === 'settings') {
     title = 'This phone';
-    body = `<div class="opt"><div class="lab"><span>Look</span><span class="muted small">trying out five; one will be kept</span></div>
+    body = `<div class="opt"><div class="lab"><span>Look</span></div>
         <div class="seg wrap">${THEMES.map(([id, name]) => `<button data-act="theme" data-a="${id}" class="${prefs.theme === id ? 'on' : ''}">${name}</button>`).join('')}</div></div>
       <div class="opt"><div class="lab"><span>Four-colour deck</span><span class="mini">${['As', 'Ah', 'Ad', 'Ac'].map((c) => cardHtml(c)).join('')}</span></div>
         <div class="seg">${[[0, 'Off'], [1, 'On']].map(([v, l]) => `<button data-act="pref" data-a="deck4" data-b="${v}" class="${Number(prefs.deck4) === v ? 'on' : ''}">${l}</button>`).join('')}</div></div>
@@ -749,6 +762,7 @@ function renderHelp() {
   const per = r.stakeCents * (r.layout === 'crossword' ? 2 : 1);
   const dealer = view.dealerRotate ? nameOfPlayer(view.control) : null;
   return `<p class="muted small" style="margin:0 0 10px">${inRound ? 'The rules of this round.' : 'The rules set for the next round.'}</p>${basics}
+    ${item('Game', gameName(), 'Built-in games set all the rules below in one tap. Change any single rule and it becomes a custom version of that game. The stake and win % are separate.')}
     ${item('Hole cards', variantName(r), variants[key])}
     ${key === 'pine' ? item('Discard', r.discardTiming === 'pre' ? 'Before the flop' : 'After the flop', r.discardTiming === 'pre' ? 'You throw one card away before any board cards are shown.' : 'You see every flop first, then throw one card away.') : ''}
     ${r.layout === 'crossword'
@@ -819,6 +833,8 @@ function renderLobby(host, ctrl) {
   const roundNo = (view.log.length ? view.log[view.log.length - 1].no : 0) + 1;
   const rules = ctrl
     ? `${lock ? '<div class="lock">🔒 Rules are locked until the carryover pot has been played out.</div>' : ''}
+      <div class="opt"><div class="lab"><span>Game</span><b class="co">${esc(gameName())}</b></div>
+        <div class="seg wrap presets">${PRESETS.map((p) => `<button data-act="preset" data-a="${p.id}" class="${view.preset === p.id ? 'on' : view.presetFrom === p.id ? 'from' : ''}" ${dis ? 'disabled' : ''}>${esc(p.name)}</button>`).join('')}</div></div>
       <div class="opt"><div class="lab"><span>Hole cards</span></div>${seg('variant', r.hole === 5 && r.free ? '5f' : r.hole, [[2, '2', "Hold'em"], [4, '4', 'Omaha'], [5, '5', 'Pineapple'], ['5f', '5', 'Any (keep all)']], dis)}</div>
       ${r.hole === 5 && !r.free ? `<div class="opt"><div class="lab"><span>Discard one card</span></div>${seg('discardTiming', r.discardTiming, [['pre', 'Before the flop'], ['post', 'After the flop']], dis)}</div>` : ''}
       ${r.hole === 5 && r.free ? '<p class="muted small" style="margin:-4px 0 10px">Keep all five. Each board plays your best hand using 0, 1 or 2 of them.</p>' : ''}
@@ -828,7 +844,7 @@ function renderLobby(host, ctrl) {
       <div class="opt"><div class="lab"><span>Show win %</span>${!r.showOdds && view.oddsOn ? '<span class="muted small">always on vs CPUs</span>' : ''}</div>${seg('showOdds', r.showOdds ? 1 : 0, [[0, 'Off'], [1, 'On']], false)}</div>
       ${host ? `<div class="opt"><div class="lab"><span>Who deals</span></div>${seg('dealerRotate', view.dealerRotate ? 1 : 0, [[0, 'Host', 'every round'], [1, 'Passes around', 'dealer picks the rules']], false, 'option')}</div>` : ''}
       <div class="opt row"><div class="grow">Base stake per player</div><div class="stake">$<input class="text" id="stake" type="number" inputmode="decimal" min="0.01" step="0.01" value="${(r.stakeCents / 100).toFixed(2)}" ${dis ? 'disabled' : ''}></div></div>`
-    : `<p style="margin:0 0 8px"><b>${esc(rulesLine(r))}</b><br><span class="muted">Base stake ${money(r.stakeCents)} per player · win % ${view.oddsOn ? 'on' : 'off'}</span></p>`;
+    : `<p style="margin:0 0 8px"><b class="co">${esc(gameName())}</b><br><b>${esc(rulesLine(r))}</b><br><span class="muted">Base stake ${money(r.stakeCents)} per player · win % ${view.oddsOn ? 'on' : 'off'}</span></p>`;
   const bar = [];
   if (ctrl) bar.push(`<button class="btn" data-act="deal" ${view.plan.ok ? '' : 'disabled'}>Deal round ${roundNo}</button>`);
   if (host) bar.push('<button class="btn danger sm" style="width:100%" data-act="end">End game and settle up</button>');

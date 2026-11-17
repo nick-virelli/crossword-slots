@@ -754,3 +754,34 @@ test('results carry the before-the-flop chance, and luck adds up', () => {
   if (unlucky) assert.equal(luck.get(unlucky.name), Math.min(...luck.values()));
   assert.deepEqual(computeAwards([]), []);
 });
+
+test('presets: picking one sets the rules; changing a rule makes it custom', async () => {
+  const { PRESETS, presetOf } = await import('../js/engine.js');
+  assert.equal(PRESETS.length, 6);
+  for (const p of PRESETS) {
+    assert.equal(p.rules.carryover, true);
+    assert.ok(p.rules.layout === 'crossword' || p.rules.boards === 5);
+  }
+  const s = newSession('ABCD', 'd1', 'Nick');
+  const stake = s.rules.stakeCents;
+  assert.equal(viewFor(s, 'p1').preset, null);
+  assert.ok(setRules(s, { preset: 'tiffany' }).ok);
+  assert.deepEqual([s.rules.hole, s.rules.free, s.rules.discardTiming, s.rules.layout, s.rules.carryover], [5, false, 'post', 'crossword', true]);
+  assert.equal(s.rules.stakeCents, stake);
+  let v = viewFor(s, 'p1');
+  assert.equal(v.preset, 'tiffany');
+  setRules(s, { carryover: false });
+  v = viewFor(s, 'p1');
+  assert.equal(v.preset, null);
+  assert.equal(v.presetFrom, 'tiffany');
+  setRules(s, { carryover: true });
+  assert.equal(viewFor(s, 'p1').preset, 'tiffany');
+  setRules(s, { stakeCents: 500 }); // the stake is not part of a preset
+  assert.equal(viewFor(s, 'p1').preset, 'tiffany');
+  setRules(s, { preset: 'holdem' });
+  assert.equal(presetOf(s.rules), 'holdem');
+  assert.equal(s.rules.boards, 5);
+  setRules(s, { boards: 2 });
+  assert.equal(viewFor(s, 'p1').preset, null);
+  assert.equal(viewFor(s, 'p1').presetFrom, 'holdem');
+});
